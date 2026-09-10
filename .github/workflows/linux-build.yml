@@ -1,0 +1,183 @@
+name: Linux Build
+# run-name contains the GitLab pipeline id so the GitLab job can find
+# exactly its own run when polling the GitHub API.
+run-name: "Linux build ${{ inputs.build_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Correlation id from the triggering GitLab pipeline"
+        required: true
+        type: string
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      # The dispatched ref is the gitlab-mirror branch — a history-free
+      # snapshot pushed by GitLab CI. Nothing here may rely on git history.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Tauri v2 needs webkit2gtk-4.1 (NOT 4.0). libfuse2 lets the
+      # linuxdeploy AppImage tooling run on the runner; patchelf is used by
+      # the AppImage bundler itself.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libfuse2 \
+            rpm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: linux
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # tauri.conf.json's bundle.targets is ["nsis"] (Windows-only), so the
+      # Linux targets are forced on the command line. No CARGO_TARGET_DIR
+      # override on CI: bundles land in src-tauri/target/release/bundle/.
+      - name: Build AppImage + deb + rpm
+        run: |
+          set -o pipefail
+          # rust-cache restores target/ — remove stale bundles so we can
+          # never ship an artifact from a previous run.
+          rm -rf src-tauri/target/release/bundle
+          npx tauri build --bundles appimage deb rpm 2>&1 | tee build.log || {
+            echo "===== tauri build failed - error lines ====="
+            grep -nE "error(\[|:)|error generated|failed to|panicked" build.log | tail -n 40 || true
+            echo "===== last 200 lines of the build log ====="
+            tail -n 200 build.log
+            exit 1
+          }
+
+      - name: Collect artifacts (AppImage, deb, rpm) + portable tar.gz
+        run: |
+          set -e
+          mkdir -p out
+          cp src-tauri/target/release/bundle/appimage/*.AppImage out/ || { echo "ERROR: no .AppImage produced"; ls -R src-tauri/target/release/bundle || true; exit 1; }
+          cp src-tauri/target/release/bundle/deb/*.deb        out/ || { echo "ERROR: no .deb produced"; ls -R src-tauri/target/release/bundle || true; exit 1; }
+          cp src-tauri/target/release/bundle/rpm/*.rpm        out/ || { echo "ERROR: no .rpm produced"; ls -R src-tauri/target/release/bundle || true; exit 1; }
+
+          # Portable tar.gz: the raw binary + icon + .desktop + a no-root
+          # install.sh that drops it into ~/.local. Extract and run ./reader,
+          # or run ./install.sh to add a menu entry.
+          BIN="src-tauri/target/release/reader"
+          [ -x "$BIN" ] || { echo "ERROR: binary $BIN not found"; ls -la src-tauri/target/release | head; exit 1; }
+          VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          PORT="Mediamaster"
+          rm -rf "$PORT" && mkdir "$PORT"
+          cp "$BIN" "$PORT/reader"
+          chmod +x "$PORT/reader"
+          cp src-tauri/icons/icon.png "$PORT/icon.png"
+          # The .desktop is named reader.desktop and StartupWMClass=reader to
+          # match the app's runtime app_id (Tauri/GTK derives it from the binary
+          # name "reader"). On GNOME-Wayland the taskbar/dock icon only shows
+          # when the window's app_id matches an installed .desktop this way.
+          cat > "$PORT/reader.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Name=Mediamaster
+          Exec=reader
+          Icon=mediamaster
+          Type=Application
+          Categories=AudioVideo;Player;Network;
+          Comment=Calibre-Web, Jellyfin & Audiobookshelf client
+          Terminal=false
+          StartupWMClass=reader
+          DESKTOP
+          cat > "$PORT/install.sh" <<'INSTALL'
+          #!/bin/sh
+          # Install Mediamaster into ~/.local (no root required).
+          set -e
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" \
+                   "$HOME/.local/share/icons/hicolor/512x512/apps"
+          install -m755 "$DIR/reader" "$HOME/.local/bin/reader"
+          install -m644 "$DIR/icon.png" "$HOME/.local/share/icons/hicolor/512x512/apps/mediamaster.png"
+          sed "s|^Exec=.*|Exec=$HOME/.local/bin/reader|" "$DIR/reader.desktop" \
+            > "$HOME/.local/share/applications/reader.desktop"
+          echo "Installed to ~/.local. Ensure ~/.local/bin is on PATH, then launch 'Mediamaster' from your menu or run: reader"
+          INSTALL
+          chmod +x "$PORT/install.sh"
+          tar czf "out/Mediamaster-${VER}-x86_64.tar.gz" "$PORT"
+          ls -la out
+
+      # Arch Linux package (.pkg.tar.zst). Tauri has no target for it, so we
+      # package the already-built binary with makepkg inside an Arch container
+      # (makepkg refuses root, so it runs as a build user). No compilation —
+      # package() just installs the prebuilt files, so --nodeps is safe.
+      - name: Build Arch package (.pkg.tar.zst)
+        run: |
+          set -e
+          VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          rm -rf archpkg && mkdir archpkg
+          cp src-tauri/target/release/reader archpkg/reader
+          cp src-tauri/icons/icon.png        archpkg/icon.png
+          cp Mediamaster/reader.desktop      archpkg/reader.desktop
+          cat > archpkg/PKGBUILD <<PKGBUILD
+          # Maintainer: MadManChLP
+          pkgname=mediamaster
+          pkgver=${VER}
+          pkgrel=1
+          pkgdesc="Calibre-Web, Jellyfin & Audiobookshelf client"
+          arch=('x86_64')
+          url="https://gitlab.gpz-hs.de/chhammerl/reader"
+          license=('custom')
+          depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator')
+          options=('!strip' '!debug')
+          source=('reader' 'icon.png' 'reader.desktop')
+          sha256sums=('SKIP' 'SKIP' 'SKIP')
+          package() {
+            install -Dm755 "\$srcdir/reader" "\$pkgdir/usr/bin/reader"
+            install -Dm644 "\$srcdir/icon.png" "\$pkgdir/usr/share/icons/hicolor/512x512/apps/mediamaster.png"
+            install -Dm644 "\$srcdir/reader.desktop" "\$pkgdir/usr/share/applications/reader.desktop"
+          }
+          PKGBUILD
+          docker run --rm -v "$PWD/archpkg":/pkg archlinux:latest bash -c '
+            pacman -Syu --noconfirm --needed base-devel
+            useradd -m builder
+            chown -R builder /pkg
+            su builder -c "cd /pkg && makepkg -f --nodeps"
+          '
+          cp archpkg/*.pkg.tar.zst out/
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-linux
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+      # Keep the full build log around when the build fails — the step
+      # output only shows the tail.
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+# ci-push: pipeline 335 commit f3ff2b0bed1df12ce416d48361663af8c41b2471

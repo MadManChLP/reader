@@ -1,0 +1,990 @@
+# Builds all platform artifacts by remote-controlling GitHub Actions, since
+# the only GitLab runner is an alpine Linux box (tag reader_linux) that cannot
+# build natively for any target platform.
+#
+# Pipeline layout (all automatic on every push to master):
+#
+#   stage mirror : ONE job force-pushes a history-free snapshot of HEAD to the
+#                  gitlab-mirror branch on GitHub (the repo history contains
+#                  committed node_modules/ and src-tauri/target/ blobs >100 MB
+#                  which GitHub rejects, so full history can never be pushed),
+#                  uniquifies EVERY file under .github/workflows/ so GitHub
+#                  (re)registers them all, ensures the mirror branch is the
+#                  default branch, and waits until all workflows in the
+#                  snapshot are registered/dispatchable.
+#   stage build  : one job per platform ONLY dispatches its workflow with a
+#                  correlation build_id, finds its run via the run-name /
+#                  display_title, polls to completion, downloads the GitHub
+#                  artifact(s) and re-exposes them as GitLab artifacts.
+#                  Build jobs run concurrently and are independent — one
+#                  platform failing does not cancel the others.
+#   stage release: dev-release (automatic) uploads all five platforms'
+#                  artifacts under STABLE filenames to the generic package
+#                  registry (package reader-dev, version dev — the download
+#                  URLs always serve the newest upload) and creates/updates
+#                  the rolling "dev" GitLab release pointing at them.
+#                  version-release (automatic, driven by release.conf) cuts a
+#                  full versioned release ONLY when release.conf has
+#                  full_release=true — uploads to package reader/<version> and
+#                  creates tag v<version> + a permanent GitLab release. Both are
+#                  all-or-nothing: they only run when every platform build
+#                  succeeded. commit-version-bump then writes the version into
+#                  the repo (package.json, package-lock.json, tauri.conf.json,
+#                  reader-setup.iss) and resets full_release=false, pushing
+#                  back to master with a [skip ci] commit.
+#   stage publish: publish-source is the SINGLE writer of the SideStore source
+#                  (source.json) and the desktop/Android update manifest
+#                  (updates.json). It runs after BOTH release jobs so a full
+#                  release's new v<version> is already created — avoiding the
+#                  race where the two release-stage jobs clobbered each other's
+#                  manifest with stale stable info.
+#
+# Version source of truth: release.conf (version=X.Y.Z, full_release=bool).
+# The mirror job stamps `version` into the built binaries via
+# scripts/set-version.sh; edit release.conf to bump — never the four files.
+#
+# Conventions (the GitHub workflow files must match these exactly):
+#
+#   workflow file                        run-name                artifact(s)
+#   .github/workflows/ios-build.yml      iOS build <build_id>     reader-ios-ipa
+#   .github/workflows/windows-build.yml  Windows build <build_id> reader-windows-setup, reader-windows-exe
+#   .github/workflows/linux-build.yml    Linux build <build_id>   reader-linux
+#   .github/workflows/macos-build.yml    macOS build <build_id>   reader-macos
+#   .github/workflows/android-build.yml  Android build <build_id> reader-android-apk
+#
+# Required CI/CD variables (Settings → CI/CD → Variables, masked):
+#   GITHUB_PAT        - GitHub token with repo contents write, actions
+#                       read/write and workflow scope (to push .github/workflows/)
+#   GITHUB_REPO       - e.g. "MadManChLP/reader"
+#   GITLAB_PUSH_TOKEN - Project Access Token with `write_repository` scope,
+#                       used ONLY by commit-version-bump to push the version
+#                       bump back to master. Without it, full releases still
+#                       publish but the repo files are not auto-updated.
+
+stages:
+  - mirror
+  - build
+  - release
+  - publish
+
+# Shared runner setup + GitHub API helper. GitLab concatenates before_script
+# and script into one shell script, so gh_api() is available in script blocks.
+.gh-base:
+  tags:
+    - reader_linux
+  image: alpine:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  before_script:
+    # skip_build=true in release.conf turns this pipeline into a no-op (e.g. a
+    # docs/README-only change): exit before doing any work. Only
+    # commit-version-bump still runs, to reset the flag. (rules: can't read a
+    # file, so the skip is enforced per-job here — before_script and script are
+    # one shell, so this exit ends the job successfully.)
+    - |
+      if [ "$(awk -F= '/^[[:space:]]*skip_build[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print tolower($2);exit}' release.conf 2>/dev/null)" = "true" ]; then
+        echo "skip_build=true — skipping this job (no build/release)."; exit 0
+      fi
+    - apk add --no-cache git curl jq unzip
+    - |
+      gh_api() {
+        curl -fsS \
+          -H "Authorization: Bearer ${GITHUB_PAT}" \
+          -H "Accept: application/vnd.github+json" \
+          "$@"
+      }
+
+# ---------------------------------------------------------------------------
+# Stage: mirror — push the snapshot ONCE for the whole pipeline.
+# With all build jobs automatic they run concurrently; per-job force-pushes
+# of the mirror branch would race each other, so the push happens exactly
+# once here and the build jobs only dispatch/poll.
+# ---------------------------------------------------------------------------
+mirror:
+  extends: .gh-base
+  stage: mirror
+  timeout: 30m
+  variables:
+    GIT_DEPTH: "1"                # only HEAD's tree is needed — we push a history-free snapshot
+    GITHUB_BRANCH: gitlab-mirror  # branch on GitHub the mirror push targets
+  script:
+    # 1. Build a history-free snapshot of HEAD.
+    #    node_modules, src-tauri/target, dist, dist-electron, release and any
+    #    file over 95 MB are stripped (GitHub hard-rejects >100 MB blobs).
+    - |
+      export GIT_INDEX_FILE="$(mktemp)"
+      git read-tree HEAD
+      git rm -r --cached -q --ignore-unmatch node_modules src-tauri/target dist dist-electron release
+      # belt and braces: drop anything else over GitHub's 100 MB limit
+      git ls-tree -r -l "$(git write-tree)" | awk -F'\t' '{split($1,a," "); if (a[4]+0 > 95000000) print $2}' \
+        | while IFS= read -r f; do echo "Dropping oversized file: $f"; git rm --cached -q "$f"; done
+      # Uniquify EVERY workflow file's content on every push. GitHub only
+      # (re)registers a workflow when a push CHANGES the workflow file's blob
+      # on the default branch — enabling Actions or changing the default branch
+      # does NOT retroactively register existing files. Appending a unique
+      # comment guarantees a fresh blob, so every workflow always gets indexed
+      # and becomes dispatchable.
+      git ls-files -- '.github/workflows/*.yml' '.github/workflows/*.yaml' > workflows.txt
+      echo "Workflows in this snapshot:"
+      cat workflows.txt
+      while IFS= read -r WF_PATH; do
+        WF_TMP="$(mktemp)"
+        git cat-file blob ":${WF_PATH}" > "$WF_TMP"
+        printf '\n# ci-push: pipeline %s commit %s\n' "${CI_PIPELINE_ID}" "${CI_COMMIT_SHA}" >> "$WF_TMP"
+        WF_BLOB=$(git hash-object -w "$WF_TMP")
+        git update-index --add --cacheinfo 100644 "$WF_BLOB" "$WF_PATH"
+        rm -f "$WF_TMP"
+      done < workflows.txt
+
+      # Stamp the version from release.conf into every file that hard-codes it,
+      # so the binaries GitHub builds from this snapshot carry the right number.
+      # We edit the working tree (present in the checkout) and stage the four
+      # files into the snapshot index. The REAL repo files are updated later by
+      # the commit-version-bump job, and only after a successful full release.
+      VERSION=$(awk -F= '/^[[:space:]]*version[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print $2;exit}' release.conf)
+      FULL_RELEASE=$(awk -F= '/^[[:space:]]*full_release[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print tolower($2);exit}' release.conf)
+      echo "release.conf -> version=${VERSION} full_release=${FULL_RELEASE}"
+      echo "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "release.conf version '${VERSION}' is not X.Y.Z"; exit 1; }
+      sh scripts/set-version.sh "${VERSION}"
+
+      # Overwrite src/buildInfo.ts with real build metadata so the in-app
+      # updater knows this build's version, pipeline id, and where to fetch the
+      # update manifest. The committed file is a local-dev placeholder.
+      MANIFEST_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/reader-source/latest/updates.json"
+      BUILT_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+      printf 'export const BUILD_INFO = {\n  version: "%s",\n  buildId: %s,\n  builtAt: "%s",\n  updateManifestUrl: "%s",\n} as const\n' \
+        "${VERSION}" "${CI_PIPELINE_ID}" "${BUILT_AT}" "${MANIFEST_URL}" > src/buildInfo.ts
+      echo "src/buildInfo.ts ->"; cat src/buildInfo.ts
+
+      # Capture recent commit subjects for the Android F-Droid changelog
+      # fallback (used when RELEASENOTES.md is empty). The runner is shallow and
+      # the snapshot is history-free, so read them from the GitLab commits API
+      # (cheap — no git history/blobs) and bake the file into the snapshot.
+      curl -fsS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/commits?per_page=15&ref_name=${CI_COMMIT_SHA}" 2>/dev/null \
+        | jq -r '.[] | "- " + .title' > recent-commits.txt 2>/dev/null || true
+      [ -s recent-commits.txt ] || echo "- See the project history for changes." > recent-commits.txt
+      RC_BLOB=$(git hash-object -w recent-commits.txt)
+      git update-index --add --cacheinfo 100644 "$RC_BLOB" fdroid/recent-commits.txt
+      echo "fdroid/recent-commits.txt ->"; cat recent-commits.txt
+
+      git update-index --add package.json package-lock.json src-tauri/tauri.conf.json installer/reader-setup.iss src/buildInfo.ts
+
+      TREE=$(git write-tree)
+      COMMIT=$(GIT_AUTHOR_NAME="GitLab CI" GIT_AUTHOR_EMAIL="ci@gitlab.local" \
+               GIT_COMMITTER_NAME="GitLab CI" GIT_COMMITTER_EMAIL="ci@gitlab.local" \
+               git commit-tree "$TREE" -m "GitLab mirror of ${CI_COMMIT_SHA} (pipeline ${CI_PIPELINE_ID})")
+      unset GIT_INDEX_FILE
+      echo "Pushing snapshot ${COMMIT} of ${CI_COMMIT_SHA} to github.com/${GITHUB_REPO} (${GITHUB_BRANCH})"
+      git push --force "https://x-access-token:${GITHUB_PAT}@github.com/${GITHUB_REPO}.git" "${COMMIT}:refs/heads/${GITHUB_BRANCH}"
+
+    # 2. Make the mirror branch the default branch — GitHub only registers
+    #    workflows for API dispatch from the default branch. Idempotent.
+    - |
+      DEFAULT_BRANCH=$(gh_api "https://api.github.com/repos/${GITHUB_REPO}" | jq -r '.default_branch')
+      if [ "$DEFAULT_BRANCH" != "$GITHUB_BRANCH" ]; then
+        echo "Switching GitHub default branch: $DEFAULT_BRANCH -> $GITHUB_BRANCH"
+        gh_api -X PATCH "https://api.github.com/repos/${GITHUB_REPO}" \
+          -d "{\"default_branch\":\"${GITHUB_BRANCH}\"}" > /dev/null \
+          || { echo "Could not change default branch — set it to ${GITHUB_BRANCH} manually in GitHub → Settings → Branches"; exit 1; }
+      fi
+
+    # 3. Wait for GitHub to register ALL workflows from the snapshot.
+    #    The push just changed every workflow blob, which triggers indexing;
+    #    this normally completes within a few seconds.
+    - |
+      echo "Actions permissions on the repo:"
+      if PERMS_JSON=$(gh_api "https://api.github.com/repos/${GITHUB_REPO}/actions/permissions" 2>/dev/null); then
+        echo "  $(echo "$PERMS_JSON" | jq -c .)"
+      else
+        echo "  (cannot read — token lacks admin read; check Settings → Actions → General in the browser)"
+      fi
+
+      echo "Waiting for GitHub to register all workflows..."
+      MISSING=""
+      for i in $(seq 1 36); do
+        WF_LIST=$(gh_api "https://api.github.com/repos/${GITHUB_REPO}/actions/workflows?per_page=100")
+        MISSING=""
+        while IFS= read -r p; do
+          FOUND=$(echo "$WF_LIST" | jq -r --arg p "$p" '.workflows[] | select(.path == $p) | .id' | head -n1)
+          [ -n "$FOUND" ] || MISSING="${MISSING} ${p}"
+        done < workflows.txt
+        if [ -z "$MISSING" ]; then
+          echo "  all workflows registered"
+          break
+        fi
+        echo "  not registered yet (attempt ${i}):${MISSING}"
+        echo "  GitHub currently knows: $(echo "$WF_LIST" | jq -c '[.workflows[].path]')"
+        sleep 5
+      done
+      if [ -n "$MISSING" ]; then
+        echo "These workflows never registered:${MISSING}"
+        echo "Most likely a YAML error in a workflow file — open the repo's Actions tab in a browser to see the parse error."
+        exit 1
+      fi
+
+    # 4. Export what the build jobs need (dotenv artifact).
+    - |
+      {
+        echo "BUILD_ID=gitlab-${CI_PIPELINE_ID}"
+        echo "GITHUB_BRANCH=${GITHUB_BRANCH}"
+        echo "MIRROR_COMMIT=${COMMIT}"
+        echo "APP_VERSION=${VERSION}"
+        echo "FULL_RELEASE=${FULL_RELEASE}"
+      } > build.env
+      cat build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# Stage: build — one dispatch/poll/fetch job per platform.
+# Parameterized by:
+#   WF_PATH        - workflow file path on GitHub
+#   RUN_PREFIX     - run-name prefix; the run's display_title must be
+#                    "<RUN_PREFIX> <BUILD_ID>"
+#   ARTIFACT_NAMES - space-separated GitHub artifact names to download
+#   OUTPUT_FILES   - space-separated files/globs that must exist after unzip
+# BUILD_ID and GITHUB_BRANCH come from the mirror job's dotenv artifact.
+# ---------------------------------------------------------------------------
+.dispatch-build:
+  extends: .gh-base
+  stage: build
+  timeout: 2h
+  needs:
+    - job: mirror
+      artifacts: true
+  script:
+    # 1. Resolve the workflow ID (dispatch by ID survives name-resolution quirks).
+    - |
+      : "${BUILD_ID:?BUILD_ID missing — mirror job dotenv artifact not received}"
+      : "${GITHUB_BRANCH:?}" "${WF_PATH:?}" "${RUN_PREFIX:?}" "${ARTIFACT_NAMES:?}"
+      echo "Looking up workflow id for ${WF_PATH}"
+      WF_ID=""
+      for i in $(seq 1 12); do
+        WF_ID=$(gh_api "https://api.github.com/repos/${GITHUB_REPO}/actions/workflows?per_page=100" \
+          | jq -r --arg p "$WF_PATH" '.workflows[] | select(.path == $p) | .id' | head -n1)
+        [ -n "$WF_ID" ] && break
+        echo "  not registered yet (attempt ${i})"
+        sleep 5
+      done
+      [ -n "$WF_ID" ] || { echo "Workflow ${WF_PATH} is not registered on GitHub — did the mirror job push it?"; exit 1; }
+      echo "  workflow id: ${WF_ID}"
+
+    # 2. Dispatch with the correlation build_id (with retries).
+    - |
+      echo "Dispatching '${RUN_PREFIX} ${BUILD_ID}' (workflow ${WF_ID})"
+      DISPATCHED=""
+      for i in $(seq 1 12); do
+        HTTP=$(curl -sS -o /tmp/dispatch-resp.json -w "%{http_code}" -X POST \
+          -H "Authorization: Bearer ${GITHUB_PAT}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${WF_ID}/dispatches" \
+          -d "{\"ref\":\"${GITHUB_BRANCH}\",\"inputs\":{\"build_id\":\"${BUILD_ID}\"}}")
+        if [ "$HTTP" = "204" ]; then
+          DISPATCHED=yes
+          break
+        fi
+        echo "  dispatch returned HTTP ${HTTP}: $(cat /tmp/dispatch-resp.json)"
+        echo "  retrying in 10s..."
+        sleep 10
+      done
+      if [ -z "$DISPATCHED" ]; then
+        echo "workflow_dispatch failed even though the workflow is registered."
+        echo "  Likely PAT permission: fine-grained needs 'Actions: Read and write'; classic needs 'repo' + 'workflow'."
+        exit 1
+      fi
+
+    # 3. Find the run whose display_title carries our BUILD_ID.
+    - |
+      RUN_ID=""
+      for i in $(seq 1 24); do
+        sleep 5
+        RUN_ID=$(gh_api "https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${WF_ID}/runs?branch=${GITHUB_BRANCH}&event=workflow_dispatch&per_page=20" \
+          | jq -r --arg t "${RUN_PREFIX} ${BUILD_ID}" '[.workflow_runs[] | select(.display_title == $t)][0].id // empty')
+        [ -n "$RUN_ID" ] && break
+      done
+      [ -n "$RUN_ID" ] || { echo "GitHub run never appeared"; exit 1; }
+      echo "GitHub run: https://github.com/${GITHUB_REPO}/actions/runs/${RUN_ID}"
+
+    # 4. Wait for completion.
+    - |
+      while :; do
+        RUN_JSON=$(gh_api "https://api.github.com/repos/${GITHUB_REPO}/actions/runs/${RUN_ID}")
+        STATUS=$(echo "$RUN_JSON" | jq -r '.status')
+        echo "  status: $STATUS"
+        [ "$STATUS" = "completed" ] && break
+        sleep 30
+      done
+      CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
+      echo "GitHub build conclusion: $CONCLUSION"
+      [ "$CONCLUSION" = "success" ] || { echo "See https://github.com/${GITHUB_REPO}/actions/runs/${RUN_ID}"; exit 1; }
+
+    # 5. Fetch the artifact(s) back into this job.
+    - |
+      ARTS_JSON=$(gh_api "https://api.github.com/repos/${GITHUB_REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100")
+      for NAME in ${ARTIFACT_NAMES}; do
+        ART_URL=$(echo "$ARTS_JSON" | jq -r --arg n "$NAME" '.artifacts[] | select(.name == $n) | .archive_download_url' | head -n1)
+        [ -n "$ART_URL" ] || { echo "Artifact ${NAME} not found on run ${RUN_ID}"; exit 1; }
+        echo "Downloading artifact ${NAME}"
+        curl -fsSL -H "Authorization: Bearer ${GITHUB_PAT}" -o "/tmp/${NAME}.zip" "$ART_URL"
+        unzip -o "/tmp/${NAME}.zip"
+      done
+      if [ -n "${OUTPUT_FILES}" ]; then
+        for f in ${OUTPUT_FILES}; do
+          ls -la $f || { echo "Expected output ${f} missing from artifact"; exit 1; }
+        done
+      else
+        ls -la
+      fi
+
+ios-ipa:
+  extends: .dispatch-build
+  variables:
+    WF_PATH: ".github/workflows/ios-build.yml"
+    RUN_PREFIX: "iOS build"
+    ARTIFACT_NAMES: "reader-ios-ipa"
+    # Reader.ipa = stable flavor (com.hammerl.reader); Reader-dev.ipa =
+    # dev flavor (com.hammerl.reader.dev) for the rolling SideStore dev app.
+    OUTPUT_FILES: "Reader.ipa Reader-dev.ipa"
+  artifacts:
+    name: "reader-ios-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - Reader.ipa
+      - Reader-dev.ipa
+    expire_in: 30 days
+
+windows-exe:
+  extends: .dispatch-build
+  variables:
+    WF_PATH: ".github/workflows/windows-build.yml"
+    RUN_PREFIX: "Windows build"
+    ARTIFACT_NAMES: "reader-windows-setup reader-windows-exe"
+    OUTPUT_FILES: "Reader-*-Setup.exe reader.exe"
+  artifacts:
+    name: "reader-windows-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - "Reader-*-Setup.exe"
+      - "reader.exe"
+    expire_in: 30 days
+
+linux-appimage:
+  extends: .dispatch-build
+  variables:
+    WF_PATH: ".github/workflows/linux-build.yml"
+    RUN_PREFIX: "Linux build"
+    ARTIFACT_NAMES: "reader-linux"
+    OUTPUT_FILES: "*.AppImage *.deb *.rpm *.tar.gz *.pkg.tar.zst"
+  artifacts:
+    name: "reader-linux-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - "*.AppImage"
+      - "*.deb"
+      - "*.rpm"
+      - "*.tar.gz"
+      - "*.pkg.tar.zst"
+    expire_in: 30 days
+
+macos-dmg:
+  extends: .dispatch-build
+  variables:
+    WF_PATH: ".github/workflows/macos-build.yml"
+    RUN_PREFIX: "macOS build"
+    ARTIFACT_NAMES: "reader-macos"
+    # The .dmg is best-effort (unsigned dmg bundling can fail on headless
+    # runners) — only the zipped .app is mandatory.
+    OUTPUT_FILES: "Reader-macos-app.zip"
+  artifacts:
+    name: "reader-macos-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - "Reader-macos-app.zip"
+      - "*.dmg"
+    expire_in: 30 days
+
+android-apk:
+  extends: .dispatch-build
+  variables:
+    WF_PATH: ".github/workflows/android-build.yml"
+    RUN_PREFIX: "Android build"
+    ARTIFACT_NAMES: "reader-android-apk"
+    # Reader.apk = stable (com.hammerl.reader); Reader-dev.apk = dev flavor
+    # (com.hammerl.reader.dev), installed side-by-side via Obtainium.
+    OUTPUT_FILES: "Reader.apk Reader-dev.apk"
+  artifacts:
+    name: "reader-android-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - Reader.apk
+      - Reader-dev.apk
+      # Signed F-Droid repo (only present when the persistent keystore is set);
+      # re-hosted by publish-fdroid. GitLab just warns if the path is absent.
+      - "fdroidrepo/"
+    expire_in: 30 days
+
+# ---------------------------------------------------------------------------
+# Stage: release — publish the built artifacts as GitLab releases.
+#
+# Files live in the project's Generic Package Registry (release "assets" in
+# GitLab are only links); the release pages link to the package download
+# URLs. Everything authenticates with CI_JOB_TOKEN — no extra secrets.
+#
+# Artifacts are staged under STABLE names so the download links never change:
+#   Reader.ipa, Reader-Setup.exe, reader.exe, Reader.AppImage, Reader.deb,
+#   Reader-macos-app.zip, Reader.dmg (optional), Reader.apk
+# ---------------------------------------------------------------------------
+.release-base:
+  stage: release
+  tags:
+    - reader_linux
+  image: alpine:latest
+  timeout: 30m
+  variables:
+    GIT_DEPTH: "1"
+  # All-or-nothing (user decision): every platform must have built.
+  needs:
+    - job: ios-ipa
+      artifacts: true
+    - job: windows-exe
+      artifacts: true
+    - job: linux-appimage
+      artifacts: true
+    - job: macos-dmg
+      artifacts: true
+    - job: android-apk
+      artifacts: true
+  before_script:
+    # skip_build=true -> no-op pipeline (docs-only change). See .gh-base.
+    - |
+      if [ "$(awk -F= '/^[[:space:]]*skip_build[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print tolower($2);exit}' release.conf 2>/dev/null)" = "true" ]; then
+        echo "skip_build=true — skipping this release job."; exit 0
+      fi
+    - apk add --no-cache curl jq
+    - |
+      gl_api() {
+        curl -fsS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" "$@"
+      }
+      # Parse release.conf — the single source of truth. Exports APP_VERSION
+      # (X.Y.Z), FULL_RELEASE, RELEASE_NOTES (all lowercased) and
+      # RELEASE_NOTES_FILE (defaults to RELEASENOTES.md). Tolerates CRLF/space.
+      read_release_conf() {
+        APP_VERSION=$(awk -F= '/^[[:space:]]*version[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print $2;exit}' release.conf)
+        FULL_RELEASE=$(awk -F= '/^[[:space:]]*full_release[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print tolower($2);exit}' release.conf)
+        RELEASE_NOTES=$(awk -F= '/^[[:space:]]*release_notes[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print tolower($2);exit}' release.conf)
+        RELEASE_NOTES_FILE=$(awk -F= '/^[[:space:]]*release_notes_file[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print $2;exit}' release.conf)
+        [ -n "$RELEASE_NOTES_FILE" ] || RELEASE_NOTES_FILE=RELEASENOTES.md
+        echo "release.conf -> version=${APP_VERSION} full_release=${FULL_RELEASE} release_notes=${RELEASE_NOTES} file=${RELEASE_NOTES_FILE}"
+        echo "${APP_VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "release.conf version '${APP_VERSION}' is not X.Y.Z"; return 1; }
+      }
+      # Echo the release-notes markdown when release_notes=true and the file has
+      # real (non-whitespace) content; otherwise echo nothing and warn (release
+      # is published with just the auto metadata). Needs read_release_conf first.
+      release_notes_body() {
+        [ "${RELEASE_NOTES}" = "true" ] || return 0
+        if [ -n "${RELEASE_NOTES_FILE}" ] && [ -f "${RELEASE_NOTES_FILE}" ] && grep -q '[^[:space:]]' "${RELEASE_NOTES_FILE}" 2>/dev/null; then
+          cat "${RELEASE_NOTES_FILE}"
+        else
+          echo "WARNING: release_notes=true but '${RELEASE_NOTES_FILE:-<unset>}' is missing or empty — publishing without notes" >&2
+        fi
+      }
+      # Stage artifacts under stable filenames into .release-files/. Required
+      # files fail the job when missing; only the .dmg is optional (unsigned
+      # dmg bundling on headless macOS runners is best-effort).
+      #
+      # $1 selects which channel-specific mobile builds to include so each
+      # channel carries only its own .ipa/.apk:
+      #   'dev'    -> Reader-dev.ipa + Reader-dev.apk (com.hammerl.reader.dev)
+      #   'stable' -> Reader.ipa     + Reader.apk     (com.hammerl.reader)
+      #   other/empty -> both.
+      # The desktop artifacts are the same binaries for both channels and are
+      # always staged.
+      stage_files() {
+        rm -rf .release-files && mkdir .release-files
+        case "$1" in
+          dev)    cp Reader-dev.ipa .release-files/Reader-dev.ipa
+                  cp Reader-dev.apk .release-files/Reader-dev.apk ;;
+          stable) cp Reader.ipa     .release-files/Reader.ipa
+                  cp Reader.apk     .release-files/Reader.apk ;;
+          *)      cp Reader.ipa .release-files/Reader.ipa
+                  cp Reader-dev.ipa .release-files/Reader-dev.ipa
+                  cp Reader.apk .release-files/Reader.apk
+                  cp Reader-dev.apk .release-files/Reader-dev.apk ;;
+        esac
+        cp Reader-*-Setup.exe    .release-files/Reader-Setup.exe
+        cp reader.exe            .release-files/reader.exe
+        cp *.AppImage            .release-files/Reader.AppImage
+        cp *.deb                 .release-files/Reader.deb
+        cp *.rpm                 .release-files/Reader.rpm
+        cp *.tar.gz              .release-files/Reader.tar.gz
+        cp *.pkg.tar.zst         .release-files/Reader.pkg.tar.zst
+        cp Reader-macos-app.zip  .release-files/Reader-macos-app.zip
+        for f in *.dmg; do [ -f "$f" ] && cp "$f" .release-files/Reader.dmg; done
+        echo "Staged release files (channel: ${1:-all}):" && ls -la .release-files
+      }
+      # Upload every staged file to generic package $1 version $2. Uploading
+      # the same filename again is fine — the download URL always serves the
+      # most recent upload.
+      upload_files() {
+        PKG_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/$1/$2"
+        for f in .release-files/*; do
+          n=$(basename "$f")
+          echo "Uploading ${n} -> ${PKG_URL}/${n}"
+          gl_api --upload-file "$f" "${PKG_URL}/${n}?select=package_file" > /dev/null
+        done
+      }
+      # JSON array of release asset links for the staged files.
+      links_json() {
+        PKG_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/$1/$2"
+        for f in .release-files/*; do
+          n=$(basename "$f")
+          jq -n --arg name "$n" --arg url "${PKG_URL}/${n}" \
+            '{name: $name, url: $url, link_type: "package"}'
+        done | jq -s .
+      }
+      # ---------------------------------------------------------------------
+      # Regenerate and publish the SideStore / AltStore source JSON.
+      #
+      # The source is a static JSON file listing two apps that SideStore can
+      # install and auto-update from:
+      #   Mediamaster      com.hammerl.reader      -> latest v<x.y.z> release
+      #   Mediamaster Dev  com.hammerl.reader.dev  -> rolling dev, buildVersion
+      #                                              = this pipeline id
+      # JSON + icon are served from the PUBLIC generic package registry (same
+      # mechanism as the IPAs), so SideStore fetches them anonymously. The
+      # source URL the user adds in SideStore is stable:
+      #   ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/reader-source/latest/source.json
+      #
+      # Called at the END of dev-release (always) and version-release (after a
+      # new v<x.y.z> is created, so the stable entry reflects it immediately).
+      # Requires .release-files/Reader-dev.ipa to be staged first.
+      publish_source_json() {
+        SRC_PKG="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/reader-source/latest"
+        ICON_URL="${SRC_PKG}/icon.png"
+        NOW=$(date -u '+%Y-%m-%d')
+        # Base version from release.conf — this is what the mirror job stamped
+        # into the built binaries, so the dev IPA's short version matches.
+        read_release_conf
+        BASE_VERSION="${APP_VERSION}"
+
+        # --- Dev app: this pipeline's dev-flavored ipa -----------------------
+        DEV_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/reader-dev/dev/Reader-dev.ipa"
+        DEV_SIZE=$(wc -c < .release-files/Reader-dev.ipa | tr -d ' ')
+        DEV_BUILD="${CI_PIPELINE_ID}"
+        DEV_VERSION="${BASE_VERSION}-dev.${DEV_BUILD}"
+        DEV_APP=$(jq -n \
+          --arg name "Mediamaster Dev" \
+          --arg bid "com.hammerl.reader.dev" \
+          --arg dev "Christian Hammerl" \
+          --arg icon "$ICON_URL" \
+          --arg ver "$DEV_VERSION" \
+          --arg build "$DEV_BUILD" \
+          --arg date "$NOW" \
+          --arg url "$DEV_URL" \
+          --argjson size "${DEV_SIZE:-0}" \
+          '{
+             name: $name, bundleIdentifier: $bid, developerName: $dev,
+             subtitle: "Rolling development build",
+             localizedDescription: "Development build of Mediamaster (Calibre-Web, Jellyfin, Audiobookshelf client). Auto-updated on every green pipeline.",
+             iconURL: $icon, tintColor: "8b5cf6", category: "entertainment",
+             screenshotURLs: [],
+             versions: [ { version: $ver, buildVersion: $build, date: $date, localizedDescription: ("Pipeline " + $build), downloadURL: $url, size: $size, minOSVersion: "14.0" } ],
+             version: $ver, buildVersion: $build, versionDate: $date,
+             versionDescription: ("Pipeline " + $build),
+             downloadURL: $url, size: $size
+           }')
+
+        # --- Stable app: latest v<x.y.z> release, if one exists --------------
+        STABLE_APP="null"
+        LATEST_TAG=$(gl_api "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases?per_page=100" \
+          | jq -r '[.[] | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort_by(.released_at) | last | .tag_name // empty')
+        if [ -n "$LATEST_TAG" ]; then
+          STABLE_VER="${LATEST_TAG#v}"
+          STABLE_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/reader/${STABLE_VER}/Reader.ipa"
+          PKG_ID=$(gl_api "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages?package_type=generic&per_page=100" \
+            | jq -r --arg n reader --arg v "$STABLE_VER" '[.[] | select(.name==$n and .version==$v)] | last | .id // empty')
+          STABLE_SIZE=0
+          if [ -n "$PKG_ID" ]; then
+            STABLE_SIZE=$(gl_api "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/${PKG_ID}/package_files" \
+              | jq -r '[.[] | select(.file_name=="Reader.ipa")] | last | .size // 0')
+          fi
+          STABLE_APP=$(jq -n \
+            --arg name "Mediamaster" \
+            --arg bid "com.hammerl.reader" \
+            --arg dev "Christian Hammerl" \
+            --arg icon "$ICON_URL" \
+            --arg ver "$STABLE_VER" \
+            --arg date "$NOW" \
+            --arg url "$STABLE_URL" \
+            --argjson size "${STABLE_SIZE:-0}" \
+            '{
+               name: $name, bundleIdentifier: $bid, developerName: $dev,
+               subtitle: "Calibre-Web, Jellyfin & Audiobookshelf client",
+               localizedDescription: "Mediamaster — a unified reader, video and music client for Calibre-Web, Jellyfin and Audiobookshelf.",
+               iconURL: $icon, tintColor: "8b5cf6", category: "entertainment",
+               screenshotURLs: [],
+               versions: [ { version: $ver, date: $date, localizedDescription: ("Release " + $ver), downloadURL: $url, size: $size, minOSVersion: "14.0" } ],
+               version: $ver, versionDate: $date,
+               versionDescription: ("Release " + $ver),
+               downloadURL: $url, size: $size
+             }')
+        fi
+
+        # --- Assemble + upload ----------------------------------------------
+        jq -n --argjson stable "$STABLE_APP" --argjson dev "$DEV_APP" \
+          --arg srcurl "${SRC_PKG}/source.json" \
+          '{
+             name: "Mediamaster",
+             identifier: "com.hammerl.reader.source",
+             subtitle: "Mediamaster — stable & dev channels",
+             sourceURL: $srcurl,
+             apps: ( (if $stable == null then [] else [$stable] end) + [$dev] ),
+             news: []
+           }' > source.json
+        echo "Generated source.json:" && cat source.json
+
+        echo "Uploading icon.png and source.json to ${SRC_PKG}"
+        gl_api --upload-file src-tauri/icons/icon.png "${SRC_PKG}/icon.png?select=package_file" > /dev/null
+        gl_api --upload-file source.json "${SRC_PKG}/source.json?select=package_file" > /dev/null
+        echo "SideStore source URL: ${SRC_PKG}/source.json"
+
+        # --- Desktop/Android update manifest (updates.json) -----------------
+        # Consumed by the in-app updater (src/utils/updater.ts). Two channels;
+        # dev is compared by buildId (pipeline id), stable by version string.
+        # Each channel also carries `notes` (the release-notes markdown shown in
+        # the mobile update notice), read from the release description's part
+        # above the auto '---' footer — so stable notes persist across pipelines
+        # (read from the actual v<x.y.z> release, not the local RELEASENOTES.md).
+        extract_notes() {
+          printf '%s\n' "$1" | grep -q '^---[[:space:]]*$' || return 0
+          printf '%s\n' "$1" | awk '/^---[[:space:]]*$/{exit} {print}'
+        }
+        DEV_DESC=$(gl_api "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases/dev" 2>/dev/null | jq -r '.description // ""')
+        DEV_NOTES=$(extract_notes "$DEV_DESC")
+        DEV_BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/reader-dev/dev"
+        DEV_MANIFEST=$(jq -n \
+          --arg ver "$BASE_VERSION" --argjson build "${CI_PIPELINE_ID}" \
+          --arg devver "$DEV_VERSION" --arg date "$NOW" --arg notes "$DEV_NOTES" \
+          --arg rel "${CI_PROJECT_URL}/-/releases/dev" --arg base "$DEV_BASE" \
+          '{ version:$ver, buildId:$build, devVersion:$devver, date:$date, releaseUrl:$rel, notes:$notes,
+             downloads: { windows:($base+"/Reader-Setup.exe"), macos:($base+"/Reader.dmg"),
+                          linux:($base+"/Reader.AppImage"), "linux-deb":($base+"/Reader.deb"),
+                          "linux-rpm":($base+"/Reader.rpm"), "linux-tar":($base+"/Reader.tar.gz"),
+                          "linux-arch":($base+"/Reader.pkg.tar.zst"),
+                          android:($base+"/Reader-dev.apk") } }')
+        STABLE_MANIFEST="null"
+        if [ -n "$LATEST_TAG" ]; then
+          STABLE_DESC=$(gl_api "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases/v${STABLE_VER}" 2>/dev/null | jq -r '.description // ""')
+          STABLE_NOTES=$(extract_notes "$STABLE_DESC")
+          STABLE_BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/reader/${STABLE_VER}"
+          STABLE_MANIFEST=$(jq -n \
+            --arg ver "$STABLE_VER" --arg date "$NOW" --arg notes "$STABLE_NOTES" \
+            --arg rel "${CI_PROJECT_URL}/-/releases/v${STABLE_VER}" --arg base "$STABLE_BASE" \
+            '{ version:$ver, date:$date, releaseUrl:$rel, notes:$notes,
+               downloads: { windows:($base+"/Reader-Setup.exe"), macos:($base+"/Reader.dmg"),
+                            linux:($base+"/Reader.AppImage"), "linux-deb":($base+"/Reader.deb"),
+                            "linux-rpm":($base+"/Reader.rpm"), "linux-tar":($base+"/Reader.tar.gz"),
+                            "linux-arch":($base+"/Reader.pkg.tar.zst"),
+                            android:($base+"/Reader.apk") } }')
+        fi
+        jq -n --argjson stable "$STABLE_MANIFEST" --argjson dev "$DEV_MANIFEST" \
+          '{ stable:$stable, dev:$dev }' > updates.json
+        echo "Generated updates.json:" && cat updates.json
+        gl_api --upload-file updates.json "${SRC_PKG}/updates.json?select=package_file" > /dev/null
+        echo "Update manifest URL: ${SRC_PKG}/updates.json"
+      }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+
+# Rolling dev release: updated by every fully green pipeline. The "dev" tag
+# is created once and left in place (moving a tag needs delete+recreate,
+# which the job token cannot do) — the description always names the actual
+# commit, and the stable package URLs always serve the newest files.
+dev-release:
+  extends: .release-base
+  script:
+    - stage_files dev
+    - upload_files reader-dev dev
+    - |
+      # Dev version = same string SideStore shows: <base>-dev.<pipeline-id>.
+      read_release_conf
+      DEV_VERSION="${APP_VERSION}-dev.${CI_PIPELINE_ID}"
+      # released_at is bumped to NOW on every pipeline so the single rolling
+      # "dev" release always sorts as the most recent release (GitLab orders
+      # releases by released_at). One release, tag stays 'dev'.
+      NOW_ISO=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+      REL_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
+      FOOTER=$(printf 'Rolling development build %s — updated on every green pipeline.\n\n- Commit: %s\n- Pipeline: %s\n- Updated: %s\n\nDownload links below always serve the newest build.' \
+        "${DEV_VERSION}" "${CI_COMMIT_SHA}" "${CI_PIPELINE_URL}" "$(date -u '+%Y-%m-%d %H:%M UTC')")
+      NOTES=$(release_notes_body)
+      if [ -n "${NOTES}" ]; then
+        DESC=$(printf '%s\n\n---\n\n%s' "${NOTES}" "${FOOTER}")
+      else
+        DESC="${FOOTER}"
+      fi
+      if gl_api "${REL_URL}/dev" > /tmp/dev-release.json 2>/dev/null; then
+        echo "Release 'dev' exists — updating name/description/date -> ${DEV_VERSION}"
+        jq -n --arg name "Development Build ${DEV_VERSION}" --arg d "$DESC" --arg ra "$NOW_ISO" \
+          '{name: $name, description: $d, released_at: $ra}' \
+          | gl_api -X PUT -H 'Content-Type: application/json' -d @- "${REL_URL}/dev" > /dev/null
+        # Prune links that no longer correspond to a staged file — e.g. the
+        # stable Reader.ipa now that the dev release carries only Reader-dev.ipa
+        # (the 'dev' release persists across pipelines, so old links linger).
+        gl_api "${REL_URL}/dev/assets/links" | jq -c '.[] | {id, name}' | while IFS= read -r link; do
+          lname=$(printf '%s' "$link" | jq -r '.name')
+          lid=$(printf '%s' "$link" | jq -r '.id')
+          if [ ! -f ".release-files/${lname}" ]; then
+            echo "Removing stale asset link: ${lname}"
+            gl_api -X DELETE "${REL_URL}/dev/assets/links/${lid}" > /dev/null
+          fi
+        done
+        # Add links for any newly appearing files (e.g. the first successful
+        # .dmg). Existing links keep working — the URLs are stable.
+        EXISTING=$(gl_api "${REL_URL}/dev/assets/links" | jq -r '.[].name')
+        PKG_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/reader-dev/dev"
+        for f in .release-files/*; do
+          n=$(basename "$f")
+          if ! printf '%s\n' "$EXISTING" | grep -qx "$n"; then
+            echo "Adding new asset link: ${n}"
+            jq -n --arg name "$n" --arg url "${PKG_URL}/${n}" \
+              '{name: $name, url: $url, link_type: "package"}' \
+              | gl_api -X POST -H 'Content-Type: application/json' -d @- "${REL_URL}/dev/assets/links" > /dev/null
+          fi
+        done
+      else
+        echo "Creating release 'dev' (tag 'dev' on ${CI_COMMIT_SHA})"
+        jq -n --arg tag dev --arg ref "${CI_COMMIT_SHA}" --arg name "Development Build ${DEV_VERSION}" \
+              --arg d "$DESC" --arg ra "$NOW_ISO" --argjson links "$(links_json reader-dev dev)" \
+          '{tag_name: $tag, ref: $ref, name: $name, description: $d, released_at: $ra, assets: {links: $links}}' \
+          | gl_api -X POST -H 'Content-Type: application/json' -d @- "${REL_URL}" > /dev/null
+      fi
+      echo "Dev release updated: ${CI_PROJECT_URL}/-/releases/dev (${DEV_VERSION})"
+    # NOTE: the SideStore source + update manifest are published by the
+    # dedicated publish-source job (publish stage), which runs AFTER both this
+    # job and version-release so a full release's new stable version is already
+    # created before the manifest is (re)generated. Publishing here would race
+    # version-release and could overwrite fresh stable info with stale data.
+
+# Versioned release: AUTOMATIC, driven by release.conf. Runs on every master
+# pipeline but no-ops unless release.conf has full_release=true. The version
+# comes from release.conf (the same number the mirror job stamped into the
+# built binaries), so no manual variable entry is needed.
+version-release:
+  extends: .release-base
+  script:
+    - read_release_conf
+    - |
+      if [ "${FULL_RELEASE}" != "true" ]; then
+        echo "release.conf full_release=${FULL_RELEASE} — dev pipeline, not cutting a versioned release."
+        exit 0
+      fi
+      REL_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
+      if gl_api "${REL_URL}/v${APP_VERSION}" > /dev/null 2>&1; then
+        echo "ERROR: release v${APP_VERSION} already exists. Bump 'version' in release.conf."
+        exit 1
+      fi
+    - |
+      # Only reach the actual release steps on a full release.
+      [ "${FULL_RELEASE}" = "true" ] || exit 0
+      stage_files stable
+      upload_files reader "${APP_VERSION}"
+      REL_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
+      FOOTER=$(printf 'Reader %s\n\n- Commit: %s\n- Pipeline: %s\n- Released: %s' \
+        "${APP_VERSION}" "${CI_COMMIT_SHA}" "${CI_PIPELINE_URL}" "$(date -u '+%Y-%m-%d %H:%M UTC')")
+      NOTES=$(release_notes_body)
+      if [ -n "${NOTES}" ]; then
+        DESC=$(printf '%s\n\n---\n\n%s' "${NOTES}" "${FOOTER}")
+      else
+        DESC="${FOOTER}"
+      fi
+      jq -n --arg tag "v${APP_VERSION}" --arg ref "${CI_COMMIT_SHA}" \
+            --arg name "Reader ${APP_VERSION}" --arg d "$DESC" \
+            --argjson links "$(links_json reader "${APP_VERSION}")" \
+        '{tag_name: $tag, ref: $ref, name: $name, description: $d, assets: {links: $links}}' \
+        | gl_api -X POST -H 'Content-Type: application/json' -d @- "${REL_URL}" > /dev/null
+      echo "Created release v${APP_VERSION}: ${CI_PROJECT_URL}/-/releases/v${APP_VERSION}"
+      # The SideStore source + update manifest are (re)generated by the
+      # publish-source job in the publish stage, which needs this job — so the
+      # v${APP_VERSION} release already exists when the manifest is built.
+
+# Commit-back after a pipeline that consumed one-shot flags. Two triggers:
+#   full_release=true  -> writes the version into the 4 files + resets it false.
+#   release_notes=true -> resets it false AND empties the notes file (the notes
+#                         were already attached to this pipeline's release(s)).
+# Runs whenever EITHER flag is set; no-op otherwise. The commit is marked
+# [skip ci] so it does NOT trigger another pipeline. Requires a masked CI/CD
+# variable GITLAB_PUSH_TOKEN — a Project Access Token with the
+# `write_repository` scope (CI_JOB_TOKEN cannot push).
+commit-version-bump:
+  stage: release
+  tags:
+    - reader_linux
+  image: alpine:latest
+  timeout: 15m
+  variables:
+    GIT_DEPTH: "1"
+  needs:
+    - job: version-release
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  before_script:
+    - apk add --no-cache git
+    - |
+      read_release_conf() {
+        APP_VERSION=$(awk -F= '/^[[:space:]]*version[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print $2;exit}' release.conf)
+        FULL_RELEASE=$(awk -F= '/^[[:space:]]*full_release[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print tolower($2);exit}' release.conf)
+        RELEASE_NOTES=$(awk -F= '/^[[:space:]]*release_notes[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print tolower($2);exit}' release.conf)
+        RELEASE_NOTES_FILE=$(awk -F= '/^[[:space:]]*release_notes_file[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print $2;exit}' release.conf)
+        [ -n "$RELEASE_NOTES_FILE" ] || RELEASE_NOTES_FILE=RELEASENOTES.md
+        SKIP_BUILD=$(awk -F= '/^[[:space:]]*skip_build[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print tolower($2);exit}' release.conf)
+        echo "release.conf -> version=${APP_VERSION} full_release=${FULL_RELEASE} release_notes=${RELEASE_NOTES} file=${RELEASE_NOTES_FILE} skip_build=${SKIP_BUILD}"
+        echo "${APP_VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "release.conf version '${APP_VERSION}' is not X.Y.Z"; return 1; }
+      }
+  script:
+    - read_release_conf
+    - |
+      # skip_build is dominant and self-contained: the whole pipeline was a
+      # no-op, so the ONLY thing to do is reset skip_build=false — nothing else
+      # (no version bump, no notes handling).
+      if [ "${SKIP_BUILD}" = "true" ]; then
+        : "${GITLAB_PUSH_TOKEN:?Set a masked CI/CD variable GITLAB_PUSH_TOKEN (Project Access Token, scope write_repository) to reset skip_build}"
+        git config user.name "GitLab CI"
+        git config user.email "ci@gitlab.local"
+        git fetch --depth=1 origin master
+        git checkout -B relbump FETCH_HEAD
+        sed -i 's/^\([[:space:]]*skip_build[[:space:]]*=\).*/\1false/' release.conf
+        git add release.conf
+        if git diff --cached --quiet; then
+          echo "skip_build already false — nothing to reset."
+          exit 0
+        fi
+        git commit -m "chore(release): reset skip_build [skip ci]"
+        git push "https://oauth2:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:master
+        echo "Reset skip_build=false on master (no build/release ran)."
+        exit 0
+      fi
+    - |
+      if [ "${FULL_RELEASE}" != "true" ] && [ "${RELEASE_NOTES}" != "true" ]; then
+        echo "full_release=${FULL_RELEASE} release_notes=${RELEASE_NOTES} — nothing to commit back."
+        exit 0
+      fi
+      : "${GITLAB_PUSH_TOKEN:?Set a masked CI/CD variable GITLAB_PUSH_TOKEN (Project Access Token, scope write_repository) to enable version commit-back}"
+
+      git config user.name "GitLab CI"
+      git config user.email "ci@gitlab.local"
+      # Base the bump on the current master tip to avoid a non-fast-forward push.
+      git fetch --depth=1 origin master
+      git checkout -B relbump FETCH_HEAD
+
+      MSG="chore(release):"
+      if [ "${FULL_RELEASE}" = "true" ]; then
+        sh scripts/set-version.sh "${APP_VERSION}"
+        sed -i 's/^\([[:space:]]*full_release[[:space:]]*=\).*/\1false/' release.conf
+        MSG="${MSG} v${APP_VERSION}"
+      fi
+      if [ "${RELEASE_NOTES}" = "true" ]; then
+        # Notes were already attached to this pipeline's release(s) — consume
+        # them: reset the flag and empty the notes file for next time.
+        sed -i 's/^\([[:space:]]*release_notes[[:space:]]*=\).*/\1false/' release.conf
+        if [ -f "${RELEASE_NOTES_FILE}" ]; then : > "${RELEASE_NOTES_FILE}"; git add "${RELEASE_NOTES_FILE}"; fi
+        MSG="${MSG} reset release notes"
+      fi
+
+      git add package.json package-lock.json src-tauri/tauri.conf.json installer/reader-setup.iss release.conf
+      if git diff --cached --quiet; then
+        echo "Nothing to commit back."
+        exit 0
+      fi
+      git commit -m "${MSG} [skip ci]"
+      git push "https://oauth2:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:master
+      echo "Committed back to master: ${MSG}"
+
+# ---------------------------------------------------------------------------
+# Stage: publish — the SINGLE writer of the SideStore source + update manifest.
+#
+# Runs after BOTH dev-release and version-release (via needs), so on a full
+# release the new v<version> release already exists when publish_source_json
+# queries "latest stable". This removes the race where dev-release and
+# version-release both published in the release stage and the later writer
+# could overwrite fresh stable info with stale data (SideStore only updating
+# on the NEXT pipeline). Runs on every pipeline — dev-only pipelines just
+# publish the rolling dev entry + whatever the current stable release is.
+# ---------------------------------------------------------------------------
+publish-source:
+  extends: .release-base
+  stage: publish
+  needs:
+    - job: ios-ipa
+      artifacts: true
+    - job: windows-exe
+      artifacts: true
+    - job: linux-appimage
+      artifacts: true
+    - job: macos-dmg
+      artifacts: true
+    - job: android-apk
+      artifacts: true
+    - job: dev-release
+      artifacts: false
+    - job: version-release
+      artifacts: false
+  script:
+    - read_release_conf
+    # 'dev' is enough — publish_source_json only reads .release-files/Reader-dev.ipa
+    # locally (for its size); the stable IPA size comes from the packages API.
+    - stage_files dev
+    - publish_source_json
+
+# ---------------------------------------------------------------------------
+# Stage: publish — re-host the signed F-Droid repository built by the GitHub
+# android job onto the PUBLIC generic package registry, so Neo Store (or any
+# F-Droid client) can install/update both apps by versionCode.
+#
+# The repo (repo/index-v1.jar + index-v2 + APKs) arrives inside the android-apk
+# artifact under fdroidrepo/repo/. It only exists when the persistent Android
+# keystore is configured (a client pins the repo's signing fingerprint, which
+# must be stable) — otherwise this job no-ops.
+#
+# Neo Store repo URL: <api>/projects/<id>/packages/generic/reader-fdroid/repo
+# The signing fingerprint to pin is printed by the GitHub build and echoed here.
+# ---------------------------------------------------------------------------
+publish-fdroid:
+  stage: publish
+  tags:
+    - reader_linux
+  image: alpine:latest
+  timeout: 20m
+  variables:
+    GIT_DEPTH: "1"
+  needs:
+    - job: android-apk
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  before_script:
+    # skip_build=true -> no-op pipeline (docs-only change). See .gh-base.
+    - |
+      if [ "$(awk -F= '/^[[:space:]]*skip_build[[:space:]]*=/{gsub(/[ "\r]/,"",$2);print tolower($2);exit}' release.conf 2>/dev/null)" = "true" ]; then
+        echo "skip_build=true — skipping F-Droid publish."; exit 0
+      fi
+    - apk add --no-cache curl
+  script:
+    - |
+      # index-v1.jar (older clients) / entry.jar (index-v2) are the signed
+      # indexes; if neither is present the repo wasn't built (no keystore).
+      if [ ! -f fdroidrepo/repo/index-v1.jar ] && [ ! -f fdroidrepo/repo/entry.jar ]; then
+        echo "No F-Droid repo in the android artifact (persistent Android keystore not set?) — skipping."
+        exit 0
+      fi
+      PKG="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/reader-fdroid/repo"
+      ( cd fdroidrepo/repo && find . -type f | while IFS= read -r f; do
+          rel="${f#./}"
+          echo "Uploading ${rel}"
+          curl -fsS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$f" \
+            "${PKG}/${rel}?select=package_file" > /dev/null \
+            || echo "  (upload failed for ${rel} — continuing)"
+        done )
+      FP=$(cat fdroidrepo/fingerprint.txt 2>/dev/null || echo "see the GitHub android build log")
+      echo "=================================================================="
+      echo " Neo Store — add this repository:"
+      echo "   URL:         ${PKG}"
+      echo "   Fingerprint: ${FP}"
+      echo "=================================================================="

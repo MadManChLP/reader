@@ -1,0 +1,107 @@
+name: macOS Build
+# run-name contains the GitLab pipeline id so the GitLab job can find
+# exactly its own run when polling the GitHub API.
+run-name: "macOS build ${{ inputs.build_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Correlation id from the triggering GitLab pipeline"
+        required: true
+        type: string
+
+jobs:
+  build-macos:
+    # macos-15 is arm64 — we ship a native aarch64 build (no universal
+    # binary; Intel users would need a separate x86_64 build).
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      # The dispatched ref is the gitlab-mirror branch — a history-free
+      # snapshot pushed by GitLab CI. Nothing here may rely on git history.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: macos
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # No Apple team / signing identity is configured, so Tauri ad-hoc
+      # signs the .app (same spirit as the unsigned iOS ipa — users
+      # right-click → Open past Gatekeeper). tauri.conf.json's
+      # bundle.targets is ["nsis"] (Windows-only), so the macOS targets are
+      # forced on the command line. The dmg bundler scripts occasionally
+      # fail on headless runners; tolerate a non-zero exit as long as a
+      # complete .app was produced and ship the zipped .app (plus the .dmg
+      # when it worked).
+      - name: Build .app + .dmg (unsigned/ad-hoc)
+        run: |
+          set -o pipefail
+          # rust-cache restores target/ — remove stale bundles so we can
+          # never ship an artifact from a previous run.
+          rm -rf src-tauri/target/release/bundle
+          npx tauri build --bundles app dmg 2>&1 | tee build.log \
+            || echo "tauri build exited non-zero — checking whether a complete .app exists anyway"
+
+          APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' 2>/dev/null | head -n1)
+          if [ -z "$APP" ]; then
+            echo "ERROR: no .app was produced."
+            echo "===== errors from the build log ====="
+            grep -nE "error(\[|:)|error generated|failed to|panicked" build.log | tail -n 40 || true
+            echo "===== last 200 lines of the build log ====="
+            tail -n 200 build.log
+            exit 1
+          fi
+
+          # Validate completeness: a partial .app has no executable.
+          EXEC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist" 2>/dev/null || true)
+          if [ -z "$EXEC" ] || [ ! -f "$APP/Contents/MacOS/$EXEC" ]; then
+            echo "ERROR: $APP is incomplete (executable '$EXEC' missing) — the build failed mid-way."
+            find "$APP" | sort
+            echo "===== last 200 lines of the build log ====="
+            tail -n 200 build.log
+            exit 1
+          fi
+
+          echo "Packaging $APP (executable: $EXEC)"
+          mkdir -p out
+          # ditto preserves symlinks/permissions inside the bundle (zip -r
+          # via GitHub's artifact packing would strip the exec bits).
+          ditto -c -k --keepParent "$APP" out/Reader-macos-app.zip
+
+          DMG=$(find src-tauri/target/release/bundle/dmg -name '*.dmg' 2>/dev/null | head -n1)
+          if [ -n "$DMG" ]; then
+            cp "$DMG" out/
+          else
+            echo "No .dmg produced (dmg bundling failed without signing) — shipping the zipped .app only"
+          fi
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-macos
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+      # Keep the full build log around when the build fails — the step
+      # output only shows the tail.
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+# ci-push: pipeline 335 commit f3ff2b0bed1df12ce416d48361663af8c41b2471

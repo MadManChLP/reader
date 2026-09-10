@@ -1,0 +1,477 @@
+name: Android Build
+# run-name contains the GitLab pipeline id so the GitLab job can find
+# exactly its own run when polling the GitHub API.
+run-name: "Android build ${{ inputs.build_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Correlation id from the triggering GitLab pipeline"
+        required: true
+        type: string
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Tauri v2 supports NDK r26/r27 — pinned so builds stay reproducible even
+      # when the runner image swaps its preinstalled default NDK.
+      NDK_VERSION: "27.2.12479018"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # ubuntu-latest ships ANDROID_HOME + cmdline-tools; install the pinned
+      # NDK and the platform/build-tools the tauri gradle template targets.
+      - name: Install Android SDK components (NDK, platform, build-tools)
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;$NDK_VERSION" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Add Rust Android target
+        run: rustup target add aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: android
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # gen/android is not committed — generate the Gradle project on the fly
+      # (mirrors the iOS workflow's `tauri ios init`). Once `src-tauri/gen/android/`
+      # gets committed this step becomes a no-op.
+      - name: tauri android init + icons
+        run: |
+          if [ ! -d src-tauri/gen/android ]; then
+            npx tauri android init
+            # writes mipmap launcher icons into gen/android res dirs
+            npx tauri icon src-tauri/icons/icon.png
+          fi
+
+      # Signing keystore. Preferred: the four ANDROID_* secrets holding a
+      # persistent release keystore, so every CI build is signed with the SAME
+      # key and updates install over the previous APK without uninstalling
+      # (see docs/development/android-build.md for how to create them). If the secrets are
+      # absent the build still succeeds with an EPHEMERAL debug keystore — but
+      # each build then has a different key, so Android refuses to upgrade an
+      # install from an earlier build (uninstall first).
+      - name: Prepare signing keystore
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          KEYSTORE="$RUNNER_TEMP/reader-release.keystore"
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            echo "Using persistent release keystore from GitHub secrets"
+            echo "$ANDROID_KEYSTORE_B64" | base64 -d > "$KEYSTORE"
+            STORE_PASS="$ANDROID_KEYSTORE_PASSWORD"
+            KEY_ALIAS="$ANDROID_KEY_ALIAS"
+            KEY_PASS="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+            # Persistent key -> stable repo fingerprint, so the F-Droid repo
+            # (pinned by fingerprint in Neo Store) can be built.
+            echo "HAS_KEYSTORE=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::ANDROID_KEYSTORE_B64 secret is not set — signing with an EPHEMERAL debug keystore. The APK will install, but the NEXT build (with a different ephemeral key) will NOT install over it. Create the four ANDROID_* secrets (see docs/development/android-build.md) for stable update-in-place signing."
+            echo "============================================================"
+            echo " WARNING: no ANDROID_KEYSTORE_B64 secret configured."
+            echo " Generating a one-off debug keystore for this build only."
+            echo " See docs/development/android-build.md to set up persistent signing."
+            echo "============================================================"
+            keytool -genkeypair -v -keystore "$KEYSTORE" \
+              -alias reader-debug -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=Reader Debug,OU=CI,O=Reader,C=DE"
+            STORE_PASS=android
+            KEY_ALIAS=reader-debug
+            KEY_PASS=android
+            # Ephemeral key changes every build -> can't pin a stable F-Droid
+            # repo fingerprint, so the F-Droid repo step is skipped.
+            echo "HAS_KEYSTORE=false" >> "$GITHUB_ENV"
+          fi
+          # Consumed by the signingConfigs block patched into build.gradle.kts
+          # in the next step. Lives only on the runner; never printed.
+          cat > src-tauri/gen/android/keystore.properties <<EOF
+          storeFile=$KEYSTORE
+          storePassword=$STORE_PASS
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASS
+          EOF
+
+      # Patch the generated project (Android equivalent of the iOS workflow's
+      # PlistBuddy/xcodeproj steps). `tauri android build` regenerates nothing —
+      # gen/android is only written by `init`, so these edits persist:
+      #   1. build.gradle.kts: signingConfigs.release fed by keystore.properties
+      #      (standard Tauri signing pattern), wired into the release buildType.
+      #   2. AndroidManifest.xml: android:usesCleartextTraffic="true" — the app
+      #      talks to LAN media servers over plain http (the Android twin of the
+      #      iOS ATS NSAllowsArbitraryLoads exception).
+      #   3. AndroidManifest.xml: mediamaster:// intent-filter on the main
+      #      activity — returns the Audiobookshelf OIDC login from the browser
+      #      back into the app (the deep-link plugin has no Android scheme
+      #      config in tauri.conf.json, so nothing is auto-generated; the
+      #      script still checks before adding to avoid double registration).
+      - name: Patch generated Android project (signing, cleartext, deep link)
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          import xml.etree.ElementTree as ET
+
+          root = pathlib.Path('src-tauri/gen/android')
+
+          # ---------- 1. build.gradle.kts: release signing ----------
+          gradle = root / 'app' / 'build.gradle.kts'
+          text = gradle.read_text()
+
+          if 'signingConfigs' in text:
+              print('signingConfigs already present — skipping gradle signing patch')
+          else:
+              if 'import java.util.Properties' not in text:
+                  text = 'import java.util.Properties\n' + text
+
+              m = re.search(r'^([ \t]*)buildTypes\s*\{', text, re.M)
+              if not m:
+                  sys.exit('ERROR: anchor "buildTypes {" not found in %s — the tauri '
+                           'android template changed. File contents:\n%s' % (gradle, text))
+              indent = m.group(1)
+              signing_block = (
+                  indent + 'signingConfigs {\n'
+                  + indent + '    create("release") {\n'
+                  + indent + '        val keystorePropertiesFile = rootProject.file("keystore.properties")\n'
+                  + indent + '        val keystoreProperties = Properties()\n'
+                  + indent + '        keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }\n'
+                  + indent + '        keyAlias = keystoreProperties["keyAlias"] as String\n'
+                  + indent + '        keyPassword = keystoreProperties["keyPassword"] as String\n'
+                  + indent + '        storeFile = file(keystoreProperties["storeFile"] as String)\n'
+                  + indent + '        storePassword = keystoreProperties["storePassword"] as String\n'
+                  + indent + '    }\n'
+                  + indent + '}\n'
+              )
+              text = text[:m.start()] + signing_block + text[m.start():]
+
+              m = re.search(r'getByName\("release"\)\s*\{', text)
+              if not m:
+                  sys.exit('ERROR: anchor getByName("release") not found in %s — the '
+                           'tauri android template changed. File contents:\n%s' % (gradle, text))
+              text = (text[:m.end()]
+                      + '\n            signingConfig = signingConfigs.getByName("release")'
+                      + text[m.end():])
+              gradle.write_text(text)
+              print('Patched release signing into', gradle)
+
+          # ---------- 2 + 3. AndroidManifest.xml ----------
+          manifest = root / 'app' / 'src' / 'main' / 'AndroidManifest.xml'
+          src = manifest.read_text()
+          for prefix, uri in re.findall(r'xmlns:([\w.-]+)="([^"]+)"', src):
+              ET.register_namespace(prefix, uri)
+          ANDROID = 'http://schemas.android.com/apk/res/android'
+          tree = ET.parse(manifest)
+          app = tree.getroot().find('application')
+          if app is None:
+              sys.exit('ERROR: no <application> element in %s' % manifest)
+
+          # Cleartext http to LAN media servers (overrides the template's
+          # ${usesCleartextTraffic} gradle placeholder, which is false in release)
+          app.set('{%s}usesCleartextTraffic' % ANDROID, 'true')
+
+          activities = app.findall('activity')
+          main = next((a for a in activities
+                       if a.get('{%s}name' % ANDROID, '').endswith('MainActivity')),
+                      activities[0] if activities else None)
+          if main is None:
+              sys.exit('ERROR: no <activity> element in %s' % manifest)
+
+          already = any(d.get('{%s}scheme' % ANDROID) == 'mediamaster'
+                        for f in main.findall('intent-filter')
+                        for d in f.findall('data'))
+          if already:
+              print('mediamaster intent-filter already present — not adding a second one')
+          else:
+              filt = ET.SubElement(main, 'intent-filter')
+              ET.SubElement(filt, 'action').set('{%s}name' % ANDROID, 'android.intent.action.VIEW')
+              ET.SubElement(filt, 'category').set('{%s}name' % ANDROID, 'android.intent.category.DEFAULT')
+              ET.SubElement(filt, 'category').set('{%s}name' % ANDROID, 'android.intent.category.BROWSABLE')
+              ET.SubElement(filt, 'data').set('{%s}scheme' % ANDROID, 'mediamaster')
+
+          tree.write(manifest, encoding='utf-8', xml_declaration=True)
+          print('Patched', manifest, '— result:')
+          print(manifest.read_text())
+          PY
+
+      # Build via `tauri android build` (runs beforeBuildCommand → frontend
+      # build, cross-compiles reader_lib for aarch64-linux-android, then
+      # gradle assembles + signs the release APK with the config above).
+      # aarch64-only, matching the iOS build: real phone hardware, and it
+      # halves build time / APK size vs a multi-ABI build.
+      - name: Build signed APK
+        run: |
+          set -o pipefail
+          # NOTE: --apk takes an explicit boolean in this CLI version
+          # ("--apk" alone fails with "a value is required for '--apk <APK>'")
+          npx tauri android build --apk true --target aarch64 2>&1 | tee /tmp/tauri-build.log \
+            || echo "tauri android build exited non-zero — checking whether a valid APK exists anyway"
+
+          echo "APKs produced:"
+          find src-tauri/gen/android/app/build/outputs -name '*.apk' -print 2>/dev/null || true
+
+          # Prefer the signed release APK (tauri outputs
+          # .../apk/universal/release/app-universal-release.apk when a signing
+          # config is present; the -unsigned variant would mean signing failed).
+          APK=$(find src-tauri/gen/android/app/build/outputs -name '*.apk' -path '*release*' ! -name '*unsigned*' 2>/dev/null | head -n1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: no signed release APK was produced."
+            echo "===== errors from the build log ====="
+            grep -nE "error(\[|:)|FAILURE:|What went wrong|failed to|panicked" /tmp/tauri-build.log | tail -n 60 || true
+            echo "===== last 200 lines of the build log ====="
+            tail -n 200 /tmp/tauri-build.log
+            exit 1
+          fi
+
+          # Completeness validation (mirrors the iOS .app checks): a hollow APK
+          # without the Rust library would only fail confusingly on-device.
+          SIZE=$(stat -c%s "$APK")
+          echo "Found APK: $APK ($SIZE bytes)"
+          if [ "$SIZE" -lt 5000000 ]; then
+            echo "ERROR: APK is suspiciously small (< 5 MB) — the build is incomplete."
+            echo "===== last 200 lines of the build log ====="
+            tail -n 200 /tmp/tauri-build.log
+            exit 1
+          fi
+          if ! unzip -l "$APK" | grep -q 'lib/arm64-v8a/libreader_lib.so'; then
+            echo "ERROR: APK contains no lib/arm64-v8a/libreader_lib.so — the Rust build never linked in."
+            unzip -l "$APK" | head -n 60
+            echo "===== last 200 lines of the build log ====="
+            tail -n 200 /tmp/tauri-build.log
+            exit 1
+          fi
+
+          # Verify the signature actually applied (debug or release key)
+          BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)
+          "$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner" verify --print-certs "$APK"
+
+          cp "$APK" "$GITHUB_WORKSPACE/Reader.apk"
+          ls -la "$GITHUB_WORKSPACE/Reader.apk"
+
+      # Build a SECOND, dev-flavored APK with a distinct applicationId
+      # (com.hammerl.reader.dev) so it installs side-by-side with the stable app
+      # and updates independently — the Android twin of the iOS .dev flavor.
+      # Only the applicationId (final package) changes; the code namespace stays
+      # com.hammerl.reader, so this is a pure Gradle change with no code impact.
+      #
+      # CRITICAL: the dev APK gets versionCode = pipeline id (monotonic). Without
+      # a rising versionCode, Android refuses to install one dev build over the
+      # previous one (all dev builds share the base version otherwise).
+      - name: Build dev-flavored APK (com.hammerl.reader.dev)
+        run: |
+          set -o pipefail
+          DEV_BUILD=$(printf '%s' "${{ inputs.build_id }}" | tr -cd '0-9')
+          [ -n "$DEV_BUILD" ] || DEV_BUILD=1
+          BASE_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          export DEV_BUILD BASE_VERSION
+          echo "Dev flavor: com.hammerl.reader.dev  versionName=${BASE_VERSION}-dev.${DEV_BUILD}  versionCode=${DEV_BUILD}"
+
+          python3 - <<'PY'
+          import os, re, pathlib, sys
+          root = pathlib.Path('src-tauri/gen/android')
+          dev_build = os.environ['DEV_BUILD']
+          base = os.environ['BASE_VERSION']
+
+          gradle = root / 'app' / 'build.gradle.kts'
+          text = gradle.read_text()
+
+          # applicationId -> .dev (mandatory). ONLY the applicationId assignment,
+          # never the namespace (which must keep matching the code package).
+          text, n = re.subn(r'applicationId\s*=\s*"[^"]*"',
+                            'applicationId = "com.hammerl.reader.dev"', text)
+          if n == 0:
+              sys.exit('ERROR: applicationId assignment not found in %s — the tauri '
+                       'android template changed.\n%s' % (gradle, text))
+
+          # versionCode = pipeline id (replace existing, else insert into
+          # defaultConfig). Must be reliable so dev updates install in place.
+          if re.search(r'versionCode\s*=', text):
+              text = re.sub(r'versionCode\s*=[^\n]*', 'versionCode = %s' % dev_build, text)
+          else:
+              text = re.sub(r'(defaultConfig\s*\{)',
+                            r'\1\n        versionCode = %s' % dev_build, text, count=1)
+          # versionName = <base>-dev.<pipeline> (replace existing, else insert).
+          vn = '"%s-dev.%s"' % (base, dev_build)
+          if re.search(r'versionName\s*=', text):
+              text = re.sub(r'versionName\s*=[^\n]*', 'versionName = %s' % vn, text)
+          else:
+              text = re.sub(r'(defaultConfig\s*\{)',
+                            r'\1\n        versionName = %s' % vn, text, count=1)
+          gradle.write_text(text)
+          print('Patched applicationId + versionCode/versionName in', gradle)
+
+          # Launcher label -> "Mediamaster Dev" (best-effort).
+          strings = root / 'app' / 'src' / 'main' / 'res' / 'values' / 'strings.xml'
+          if strings.exists():
+              s = strings.read_text()
+              s2, ln = re.subn(r'(<string name="app_name">)[^<]*(</string>)',
+                               r'\1Mediamaster Dev\2', s)
+              if ln:
+                  strings.write_text(s2); print('Patched app_name label -> Mediamaster Dev')
+              else:
+                  print('app_name string not found — launcher label unchanged')
+          PY
+
+          echo "Rebuilding APK with dev applicationId (reuses cached Rust; re-packages/signs)..."
+          npx tauri android build --apk true --target aarch64 2>&1 | tee /tmp/tauri-dev-build.log \
+            || echo "tauri android build (dev) exited non-zero — checking for a valid APK anyway"
+
+          APK=$(find src-tauri/gen/android/app/build/outputs -name '*.apk' -path '*release*' ! -name '*unsigned*' 2>/dev/null | head -n1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: no signed dev release APK was produced."
+            grep -nE "error(\[|:)|FAILURE:|What went wrong|failed to|panicked" /tmp/tauri-dev-build.log | tail -n 60 || true
+            tail -n 200 /tmp/tauri-dev-build.log
+            exit 1
+          fi
+
+          # Verify the applicationId actually flipped to .dev.
+          BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)
+          AAPT="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt"
+          if [ -x "$AAPT" ]; then
+            PKG=$("$AAPT" dump badging "$APK" 2>/dev/null | sed -n "s/.*package: name='\([^']*\)'.*/\1/p" | head -n1)
+            echo "Dev APK package: $PKG"
+            [ "$PKG" = "com.hammerl.reader.dev" ] || { echo "ERROR: dev APK applicationId is '$PKG', expected com.hammerl.reader.dev"; exit 1; }
+          fi
+          cp "$APK" "$GITHUB_WORKSPACE/Reader-dev.apk"
+          ls -la "$GITHUB_WORKSPACE/Reader-dev.apk"
+
+      # Build a signed F-Droid repository holding BOTH apps so they install and
+      # update from Neo Store (or any F-Droid client) with reliable versionCode
+      # update detection — the fix for Obtainium not picking up the versioning.
+      # Generated here (not on GitLab) because the signing keystore + Java +
+      # Android build-tools (apksigner/aapt) are already present. Only runs with
+      # the PERSISTENT keystore: an F-Droid client pins the repo's signing
+      # fingerprint, which must stay stable across builds (the ephemeral debug
+      # key changes every run). The GitLab publish-fdroid job re-hosts the
+      # generated repo/ on the package registry.
+      - name: Build signed F-Droid repository
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -e
+          pip install --quiet fdroidserver
+          BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)
+          export PATH="$ANDROID_HOME/build-tools/$BUILD_TOOLS:$PATH"  # apksigner/aapt for fdroid
+          KEYSTORE="$RUNNER_TEMP/reader-release.keystore"
+          KEY_PASS="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+
+          AAPT="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt"
+          rm -rf fdroidrepo && mkdir -p fdroidrepo/repo
+          cp Reader.apk     fdroidrepo/repo/
+          cp Reader-dev.apk fdroidrepo/repo/
+
+          # Fastlane metadata so the Neo Store listing shows a proper name,
+          # summary, description, icon and changelog for each app. Static text
+          # is committed under fdroid/metadata/<appid>/en-US/; the icon and the
+          # per-versionCode changelog are added here.
+          mkdir -p fdroidrepo/metadata
+          cp -r fdroid/metadata/* fdroidrepo/metadata/
+
+          # High-res launcher icon per app (fdroid can't extract Tauri's
+          # adaptive Android icon, so app icons were blank in the index).
+          for appid in com.hammerl.reader com.hammerl.reader.dev; do
+            mkdir -p "fdroidrepo/metadata/$appid/en-US/images"
+            cp src-tauri/icons/icon.png "fdroidrepo/metadata/$appid/en-US/images/icon.png"
+          done
+          # Repo-level icon too (was a default fdroid placeholder).
+          cp src-tauri/icons/icon.png fdroidrepo/icon.png
+
+          # Changelog per versionCode: RELEASENOTES.md when it has content
+          # (full releases), else recent commit subjects captured by the mirror
+          # job (fdroid/recent-commits.txt — the shallow runner has no history),
+          # else a generic line. Keyed by each APK's ACTUAL versionCode.
+          if [ -s RELEASENOTES.md ] && grep -q '[^[:space:]]' RELEASENOTES.md; then
+            CHANGELOG=$(cat RELEASENOTES.md)
+          elif [ -s fdroid/recent-commits.txt ]; then
+            CHANGELOG="Recent changes:"$'\n'"$(cat fdroid/recent-commits.txt)"
+          else
+            CHANGELOG="Development build (pipeline ${{ inputs.build_id }})."
+          fi
+          write_changelog() {  # $1=apk  $2=appid
+            VC=$("$AAPT" dump badging "$1" 2>/dev/null | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -n1)
+            if [ -n "$VC" ]; then
+              mkdir -p "fdroidrepo/metadata/$2/en-US/changelogs"
+              printf '%s\n' "$CHANGELOG" > "fdroidrepo/metadata/$2/en-US/changelogs/$VC.txt"
+              echo "Changelog for $2 versionCode $VC written"
+            fi
+          }
+          write_changelog Reader.apk     com.hammerl.reader
+          write_changelog Reader-dev.apk com.hammerl.reader.dev
+
+          cd fdroidrepo
+          # repo_url is baked into the index as repo.address; F-Droid clients
+          # fetch APKs/icons relative to it. MUST use the NUMERIC project id
+          # (matches the URL the GitLab job prints) — the path-encoded id
+          # (chhammerl%2Freader) breaks when Android's HTTP client re-encodes
+          # the %2F. archive_older:0 keeps only the current build of each app.
+          cat > config.yml <<EOF
+          repo_url: "https://gitlab.gpz-hs.de/api/v4/projects/10/packages/generic/reader-fdroid/repo"
+          repo_name: "Mediamaster"
+          repo_description: "Mediamaster — stable & dev builds (Calibre-Web, Jellyfin & Audiobookshelf client)."
+          repo_icon: "icon.png"
+          archive_older: 0
+          keystore: "$KEYSTORE"
+          keystorepass: "$ANDROID_KEYSTORE_PASSWORD"
+          keypass: "$KEY_PASS"
+          repo_keyalias: "$ANDROID_KEY_ALIAS"
+          sdk_path: "$ANDROID_HOME"
+          EOF
+          fdroid update --create-metadata --pretty --delete-unknown 2>&1 | tee /tmp/fdroid.log
+
+          # Fingerprint (SHA-256 of the signing cert) the user pins in Neo Store.
+          FP=$(keytool -list -v -keystore "$KEYSTORE" -alias "$ANDROID_KEY_ALIAS" \
+                 -storepass "$ANDROID_KEYSTORE_PASSWORD" 2>/dev/null \
+               | sed -n 's/.*SHA256: *//p' | head -n1 | tr -d ': ' | tr 'A-F' 'a-f')
+          echo "$FP" > fingerprint.txt
+          echo "=================================================================="
+          echo " F-Droid repo signing fingerprint (add in Neo Store):"
+          echo "   $FP"
+          echo "=================================================================="
+          echo "Repo files:" && ls -la repo/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-android-apk
+          # fdroidrepo/** is only present when the F-Droid repo was built
+          # (persistent keystore); upload-artifact just warns if it's absent.
+          path: |
+            Reader.apk
+            Reader-dev.apk
+            fdroidrepo/**
+          retention-days: 7
+
+      # Keep the full build log around when the build fails — the step output
+      # only shows the tail.
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: /tmp/tauri-build.log
+          retention-days: 7
+
+# ci-push: pipeline 335 commit f3ff2b0bed1df12ce416d48361663af8c41b2471

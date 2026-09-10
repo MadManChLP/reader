@@ -1,0 +1,120 @@
+name: Windows Build
+# run-name contains the GitLab pipeline id so the GitLab job can find
+# exactly its own run when polling the GitHub API.
+run-name: "Windows build ${{ inputs.build_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Correlation id from the triggering GitLab pipeline"
+        required: true
+        type: string
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      # The dispatched ref is the gitlab-mirror branch — a history-free
+      # snapshot pushed by GitLab CI. Nothing here may rely on git history.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # windows-latest ships rustup with stable-x86_64-pc-windows-msvc as
+      # the default toolchain — no extra setup needed, just log it.
+      - name: Rust toolchain info
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: windows
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # --no-bundle skips Tauri's NSIS bundler (tauri.conf.json targets
+      # "nsis") — the Windows installer is produced by the existing Inno
+      # Setup script instead. Runs beforeBuildCommand (npm run
+      # build:frontend) and compiles the release exe. No CARGO_TARGET_DIR
+      # override on CI: the exe lands in src-tauri/target/release/.
+      - name: Build desktop exe (tauri build --no-bundle)
+        shell: pwsh
+        run: |
+          npx tauri build --no-bundle 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "===== tauri build failed - error lines ====="
+            Select-String -Path build.log -Pattern 'error(\[|:)|failed to|panicked' |
+              Select-Object -Last 40 | ForEach-Object { $_.Line }
+            Write-Host "===== last 200 lines of the build log ====="
+            Get-Content build.log -Tail 200
+            exit 1
+          }
+          if (-not (Test-Path "src-tauri\target\release\reader.exe")) {
+            Write-Host "ERROR: src-tauri\target\release\reader.exe was not produced."
+            Get-Content build.log -Tail 200
+            exit 1
+          }
+          Get-Item "src-tauri\target\release\reader.exe" | Format-List Name, Length, LastWriteTime
+
+      # ISCC.exe is preinstalled on windows-latest runners; fall back to
+      # choco if a future image drops it. SourcePath/MyAppVersion override
+      # the local-machine defaults hardcoded in the .iss (guarded by
+      # #ifndef there).
+      - name: Compile Inno Setup installer
+        shell: pwsh
+        run: |
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            Write-Host "ISCC.exe not preinstalled - installing Inno Setup via choco"
+            choco install innosetup -y --no-progress
+            $iscc = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) { throw "ISCC.exe not found even after choco install" }
+          Write-Host "Using $iscc"
+
+          $version = node -p "require('./src-tauri/tauri.conf.json').version"
+          $srcDir = Join-Path $env:GITHUB_WORKSPACE "src-tauri\target\release"
+          Write-Host "Building installer for version $version from $srcDir"
+
+          & $iscc "/DMyAppVersion=$version" "/DSourcePath=$srcDir" "installer\reader-setup.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem installer\output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-windows-setup
+          path: installer/output/Reader-*-Setup.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-windows-exe
+          path: src-tauri/target/release/reader.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      # Keep the full build log around when the build fails — the step
+      # output only shows the tail.
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+# ci-push: pipeline 335 commit f3ff2b0bed1df12ce416d48361663af8c41b2471

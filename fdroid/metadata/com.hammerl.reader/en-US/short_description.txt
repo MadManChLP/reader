@@ -1,0 +1,1 @@
+Reader, video & music client for Calibre-Web, Jellyfin & Audiobookshelf

@@ -1,0 +1,13 @@
+Development channel of Mediamaster. This build updates on every CI pipeline and may be unstable — install the stable "Mediamaster" app for everyday use. Both can be installed side by side.
+
+Mediamaster is a unified client for your self-hosted media library:
+
+Books: read EPUBs, PDFs and comics served by Calibre-Web, with offline downloads and reading-progress sync.
+
+Video: stream movies and TV shows from Jellyfin — resume, audio-track switching and subtitles.
+
+Music: browse and play your Jellyfin music library with queues, shuffle and repeat.
+
+Audiobooks & podcasts: listen through Audiobookshelf with progress synced across devices.
+
+One app, one set of credentials (LDAP/AD) for everything, with offline support.

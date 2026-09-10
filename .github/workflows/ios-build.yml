@@ -1,0 +1,254 @@
+name: iOS Build
+# run-name contains the GitLab pipeline id so the GitLab job can find
+# exactly its own run when polling the GitHub API.
+run-name: "iOS build ${{ inputs.build_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Correlation id from the triggering GitLab pipeline"
+        required: true
+        type: string
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # tauri ios init emits an Xcode 16 project (objectVersion 77), so we must
+      # build with Xcode 16+. Select the newest Xcode installed on the runner.
+      - name: Select latest Xcode
+        run: |
+          LATEST=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n1)
+          echo "Selecting $LATEST"
+          sudo xcode-select -s "$LATEST/Contents/Developer"
+          xcodebuild -version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Add Rust iOS target
+        run: rustup target add aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ios
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # gen/apple is not committed yet — generate the Xcode project on the fly.
+      # Once `src-tauri/gen/apple/` gets committed this step becomes a no-op.
+      - name: tauri ios init + icons + ATS exception
+        run: |
+          if [ ! -d src-tauri/gen/apple ]; then
+            npx tauri ios init
+            npx tauri icon src-tauri/icons/icon.png --ios-color "#1B1B1F"
+            PLIST=$(find src-tauri/gen/apple -maxdepth 2 -name Info.plist | head -n1)
+            echo "Patching ATS exception into $PLIST"
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST" || true
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST" || true
+            # mediamaster:// custom URL scheme — returns the Audiobookshelf
+            # OIDC login from Safari back into the app (deep-link plugin)
+            echo "Registering mediamaster:// URL scheme in $PLIST"
+            /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "$PLIST" || true
+            /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0 dict" "$PLIST" || true
+            /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string com.hammerl.reader" "$PLIST" || true
+            /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$PLIST" || true
+            /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string mediamaster" "$PLIST" || true
+            # iOS 14+ local-network privacy: without this key, connections to
+            # LAN servers (requester/Jellyfin on private IPs) are silently
+            # dropped instead of prompting the user for permission
+            /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 'This app connects to media servers on your local network.'" "$PLIST" || true
+            # Expose the app's Documents folder (where downloads live on iOS —
+            # see get_default_path) to the Files app so the user can browse,
+            # copy out or delete their downloaded books/music/video.
+            echo "Enabling Files-app access to Documents in $PLIST"
+            /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PLIST" || true
+            /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" || true
+          fi
+
+      # Patch the generated Xcode project at the TARGET level (an xcconfig
+      # can't override target settings). Edited directly with the xcodeproj
+      # gem (ships with the runner's CocoaPods). Tauri generates gen/apple
+      # only at `init` and does not overwrite it on `build`, so the edits
+      # persist into the build.
+      #
+      # 1. Disable code signing — without an Apple team, automatic signing
+      #    errors with "requires a development team". Sideloadly signs the
+      #    app on install, so an unsigned build is fine.
+      # 2. Fix Swift compatibility-lib search path — libapp.a contains Swift
+      #    objects (Tauri plugins) and iOS 14.0 deployment needs Apple's
+      #    libswiftCompatibility56/Concurrency static libs. The template
+      #    searches "$(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)", but on
+      #    Xcode 26 runners TOOLCHAIN_DIR resolves to the Metal toolchain
+      #    (no Swift libs) → "Undefined symbols __swift_FORCE_LOAD_...".
+      #    DT_TOOLCHAIN_DIR is rejected by Xcode 16+ inside build settings
+      #    ("cannot be used to evaluate LIBRARY_SEARCH_PATHS"), so resolve
+      #    the XcodeDefault toolchain to an ABSOLUTE path here in the shell
+      #    and bake that literal path into the project.
+      - name: Patch Xcode project (signing off, Swift lib path)
+        run: |
+          SWIFT_LIBS="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos"
+          echo "Swift compatibility libs in $SWIFT_LIBS:"
+          ls "$SWIFT_LIBS"/libswiftCompatibility* || { echo "ERROR: compatibility libs not found there"; exit 1; }
+          export SWIFT_LIBS
+
+          gem list -i xcodeproj >/dev/null 2>&1 || sudo gem install xcodeproj --no-document
+          cat > /tmp/patch-proj.rb <<'RUBY'
+          require 'xcodeproj'
+          path = Dir.glob('src-tauri/gen/apple/*.xcodeproj').first or abort('no .xcodeproj found')
+          proj = Xcodeproj::Project.open(path)
+          swift_path = ENV.fetch('SWIFT_LIBS')
+          proj.targets.each do |t|
+            t.build_configurations.each do |c|
+              bs = c.build_settings
+              bs['CODE_SIGNING_ALLOWED'] = 'NO'
+              bs['CODE_SIGNING_REQUIRED'] = 'NO'
+              bs['CODE_SIGN_IDENTITY'] = ''
+              bs['CODE_SIGN_STYLE'] = 'Manual'
+              bs['DEVELOPMENT_TEAM'] = ''
+              bs['PROVISIONING_PROFILE_SPECIFIER'] = ''
+              bs.delete('CODE_SIGN_ENTITLEMENTS')
+              paths = bs['LIBRARY_SEARCH_PATHS']
+              paths = paths.nil? ? ['$(inherited)'] : Array(paths)
+              paths << swift_path unless paths.include?(swift_path)
+              bs['LIBRARY_SEARCH_PATHS'] = paths
+            end
+          end
+          proj.save
+          puts "Patched targets: #{proj.targets.map(&:name).join(', ')}"
+          RUBY
+          ruby /tmp/patch-proj.rb
+
+      # Build the app through `tauri ios build` (NOT raw xcodebuild): the CLI's
+      # "Build Rust Code" xcode-script phase needs the parent tauri process to
+      # hand it build options over an IPC socket (the `-server-addr` file).
+      # Signing was disabled at the target level in the step above, so the
+      # device build succeeds unsigned with no Apple team. tauri's later
+      # export/sign step (if it runs) fails harmlessly — we package the
+      # unsigned .app ourselves and Sideloadly signs it on install.
+      - name: Build unsigned .ipa
+        run: |
+          # tauri ios build runs beforeBuildCommand (npm run build:frontend)
+          # and cross-compiles reader_lib for aarch64-apple-ios. Tolerate a
+          # non-zero exit ONLY if a complete .app was produced — tauri's final
+          # export/sign step can fail harmlessly, but a mid-build failure
+          # (e.g. Rust compile error) must fail this job instead of shipping
+          # a hollow .app skeleton.
+          set -o pipefail
+          npx tauri ios build --export-method debugging 2>&1 | tee /tmp/tauri-build.log \
+            || echo "tauri ios build exited non-zero — checking whether a complete .app exists anyway"
+
+          echo "Locating the built app/ipa ..."
+          # 1) Prefer a real exported .ipa if one exists.
+          IPA=$(find "$HOME/Library/Developer/Xcode/DerivedData" src-tauri/gen/apple -name '*.ipa' 2>/dev/null | head -n1)
+          if [ -n "$IPA" ]; then
+            echo "Found exported ipa: $IPA"
+            cp "$IPA" "$GITHUB_WORKSPACE/Reader.ipa"
+          else
+            # 2) Package the unsigned .app. tauri runs a plain `build`, so the
+            #    app lands in DerivedData/.../Build/Products/release-iphoneos.
+            APP=$(find "$HOME/Library/Developer/Xcode/DerivedData" src-tauri/gen/apple -type d -name '*.app' \( -ipath '*release-iphoneos*' -o -ipath '*.xcarchive*' \) 2>/dev/null | head -n1)
+            if [ -z "$APP" ]; then
+              echo "ERROR: no .app or .ipa was produced."
+              echo "===== errors from the build log ====="
+              grep -nE "error(\[|:)|error generated|failed to|panicked|BUILD FAILED" /tmp/tauri-build.log | tail -n 60 || true
+              echo "===== last 200 lines of the build log ====="
+              tail -n 200 /tmp/tauri-build.log
+              exit 1
+            fi
+
+            # Validate completeness: a partial .app (xcodebuild died mid-way)
+            # has no Info.plist / no executable. Shipping it would only fail
+            # later in Sideloadly with a confusing error.
+            if [ ! -f "$APP/Info.plist" ]; then
+              echo "ERROR: $APP is incomplete (no Info.plist) — xcodebuild failed mid-build."
+              echo "App bundle contents:"; find "$APP" | sort
+              echo "===== errors from the build log ====="
+              grep -nE "error(\[|:)|error generated|failed to|panicked|BUILD FAILED" /tmp/tauri-build.log | tail -n 60 || true
+              echo "===== last 200 lines of the build log ====="
+              tail -n 200 /tmp/tauri-build.log
+              exit 1
+            fi
+            EXEC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" 2>/dev/null || true)
+            if [ -z "$EXEC" ] || [ ! -f "$APP/$EXEC" ]; then
+              echo "ERROR: $APP has no executable ('$EXEC') — the link step never ran."
+              find "$APP" | sort
+              echo "===== last 200 lines of the build log ====="
+              tail -n 200 /tmp/tauri-build.log
+              exit 1
+            fi
+
+            echo "Packaging unsigned app: $APP (executable: $EXEC)"
+            rm -rf /tmp/Payload "$GITHUB_WORKSPACE/Reader.ipa"
+            mkdir /tmp/Payload
+            cp -R "$APP" /tmp/Payload/
+            ( cd /tmp && zip -qry "$GITHUB_WORKSPACE/Reader.ipa" Payload )
+            rm -rf /tmp/Payload
+          fi
+          ls -la "$GITHUB_WORKSPACE/Reader.ipa"
+
+      # Produce a SECOND, dev-flavored .ipa from the SAME unsigned build. The
+      # app is unsigned (Sideloadly re-signs on install), so we can safely
+      # repackage it under a distinct bundle id — no second Xcode build needed.
+      #   - CFBundleIdentifier  -> com.hammerl.reader.dev  (installs side-by-side
+      #     with the stable app, and SideStore treats it as its own app entry)
+      #   - CFBundleDisplayName -> "Mediamaster Dev"        (distinct on-device)
+      #   - CFBundleVersion     -> numeric GitLab pipeline id (from build_id).
+      #     Monotonic; matches the source's buildVersion.
+      #   - CFBundleShortVersionString -> "<base>-dev.<pipeline>" (e.g.
+      #     "1.8.5-dev.235"). SideStore requires the IPA's short version to
+      #     EXACTLY match the `version` declared in the source JSON, otherwise
+      #     it aborts install/update with a version-mismatch error. The source
+      #     computes the identical string (base from tauri.conf + pipeline id),
+      #     so the two always agree.
+      - name: Build dev-flavored unsigned .ipa
+        run: |
+          set -e
+          DEV_BUILD=$(printf '%s' "${{ inputs.build_id }}" | tr -cd '0-9')
+          [ -n "$DEV_BUILD" ] || DEV_BUILD=1
+          rm -rf /tmp/devwork && mkdir /tmp/devwork
+          unzip -q "$GITHUB_WORKSPACE/Reader.ipa" -d /tmp/devwork
+          APP=$(find /tmp/devwork/Payload -maxdepth 1 -type d -name '*.app' | head -n1)
+          [ -n "$APP" ] || { echo "ERROR: no .app inside Reader.ipa"; exit 1; }
+          PLIST="$APP/Info.plist"
+          BASE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+          DEV_VERSION="${BASE}-dev.${DEV_BUILD}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.hammerl.reader.dev" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $DEV_VERSION" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $DEV_BUILD" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName Mediamaster Dev" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Mediamaster Dev" "$PLIST" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Mediamaster Dev" "$PLIST"
+          echo "Dev flavor: com.hammerl.reader.dev  shortVersion=$DEV_VERSION  build=$DEV_BUILD"
+          rm -f "$GITHUB_WORKSPACE/Reader-dev.ipa"
+          ( cd /tmp/devwork && zip -qry "$GITHUB_WORKSPACE/Reader-dev.ipa" Payload )
+          rm -rf /tmp/devwork
+          ls -la "$GITHUB_WORKSPACE/Reader-dev.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-ios-ipa
+          path: |
+            Reader.ipa
+            Reader-dev.ipa
+          retention-days: 7
+
+      # Keep the full build log around when the build fails — the step output
+      # only shows the tail.
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-log
+          path: /tmp/tauri-build.log
+          retention-days: 7
+
+# ci-push: pipeline 335 commit f3ff2b0bed1df12ce416d48361663af8c41b2471

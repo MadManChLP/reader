@@ -1,0 +1,17 @@
+[package]
+name = "tauri-plugin-system-volume"
+version = "0.1.0"
+description = "Read, set and watch the system media volume on Android and iOS"
+edition = "2021"
+# Required so tauri's build tooling picks up the android/ios native projects
+# via the DEP_* cargo metadata this plugin's build script emits.
+links = "tauri-plugin-system-volume"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = "2"
+thiserror = "2"
