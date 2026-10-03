@@ -1,0 +1,14 @@
+"$schema" = "schemas/schema.json"
+[default]
+description = """
+Allows reading, setting and watching the system media volume,
+and reading/setting the screen brightness.
+"""
+permissions = [
+  "allow-get-volume",
+  "allow-set-volume",
+  "allow-watch-volume",
+  "allow-get-brightness",
+  "allow-set-brightness",
+  "allow-restore-brightness",
+]

@@ -1,0 +1,73 @@
+# Dependencies
+node_modules/
+node_modules
+node_modules/zustand
+node_modules/zustand/esm
+# Build outputs
+dist/
+dist
+dist-electron/
+dist-electron
+release/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor configs
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project specific
+localhost.har
+
+# reverences
+Blink-main
+Blink-main/
+Blink-1.0.0-alpha04
+Blink-1.0.0-alpha04/
+feishin-1.9.0
+feishin-1.9.0/
+calibre-web_API
+calibre-web_API/
+
+# Testrunns
+dl
+dl/
+cover-cache/
+
+# Installer build outputs (binaries don't belong in git)
+installer/output/
+
+# Contains real API keys / internal infrastructure details — never commit
+admin_return.json
+
+# Stray artifacts
+NDH6SA~M
+C*tempreader_orig.tsx
+
+github-logs/
+
+sync-server
+sync-server\
+
+githublogs
+githublogs\
+
+reverence
+reverence\

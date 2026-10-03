@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Blink</title>
+  <style>
+    .app-loading {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%,-50%);
+      width: 10em;
+      height: 10em;
+      background: rgb(180 180 180);
+      z-index: 100000;
+      -webkit-mask-image: url("/blink/assets/icon-outline-aCqUQFnW.png");
+              mask-image: url("/blink/assets/icon-outline-aCqUQFnW.png");
+      -webkit-mask-size: contain;
+              mask-size: contain;
+    }
+
+    .app-loading.hidden {
+      display: none;
+    }
+
+    
+    .app-loading-anim{
+      width: 150%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+      background: linear-gradient(to right,transparent,rgb(255 255 255),transparent);
+      transform: scaleX(0);
+      animation: loading 0.75s linear infinite both;
+        transform-origin: left;
+    }
+
+    @keyframes loading {
+      0%{
+        transform: translate(-100%);
+      }
+      50%{
+        transform: translate(0%);
+      }
+      100%{
+        transform: translate(100%);
+      }
+    }
+  </style>
+  <script type="module" crossorigin src="/blink/assets/index-9t9fG5_a.js"></script>
+  <link rel="stylesheet" crossorigin href="/blink/assets/index-HULa3eoZ.css">
+</head>
+
+<body>
+  <div class="app-loading">
+    <!-- <img src="./src/assets/icon-outline.svg" class="app-loading-logo" /> -->
+    <div class="app-loading-anim"></div>
+  </div>
+  <div id="root"></div>
+  <svg style="width: 0; height: 0; position: absolute" aria-hidden="true" focusable="false">
+    <linearGradient id="clr-gradient-default" x2="1" y2="1">
+      <stop offset="0%" stop-color="hsl(337, 96%, 56%)" />
+      <stop offset="100%" stop-color="hsl(273, 100%, 36%)" />
+    </linearGradient>
+  </svg>
+</body>
+
+</html>
