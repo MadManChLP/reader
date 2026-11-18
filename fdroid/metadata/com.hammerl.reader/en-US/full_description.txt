@@ -1,0 +1,11 @@
+Mediamaster is a unified desktop and mobile client for your self-hosted media library.
+
+Books: read EPUBs, PDFs and comics served by Calibre-Web, with cover art, offline downloads and reading-progress sync.
+
+Video: stream movies and TV shows from Jellyfin — resume where you left off, switch audio tracks, and turn on subtitles.
+
+Music: browse and play your Jellyfin music library in a modern player with queues, shuffle and repeat.
+
+Audiobooks & podcasts: listen through Audiobookshelf with playback progress synced across your devices.
+
+One app, one set of credentials (LDAP/AD) for everything. Once your media is downloaded it keeps working offline.

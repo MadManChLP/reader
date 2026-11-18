@@ -1,0 +1,15 @@
+- Docs: roadmap after the bug wave; fix CLAUDE.md Jellyfin examples
+- Downloads: disc-safe filenames, serial audiobook queue, stop on logout
+- EPUB: swipe and tap-zone page turns over the text on touch screens
+- Video: chapters, preferred audio on first play, keep watched state, guards
+- Requester: duplicate-request guard, server error details, safe reset timer
+- Music: disc order, full album details, queue/shuffle/autoplay state fixes
+- Touch: tap guard so sloppy swipes don't open cards, pressed states
+- Roadmap: next wave after finishing the partial features
+- Reader: EPUB highlights with notes, notes list + Markdown export, PDF/manga page bookmarks
+- Now Playing: gestures, colour background, playing from, next-up peek, desktop version
+- Real download resume with HTTP Range
+- Download panel: pause, audiobook cancel/retry, playlists as one row, speed/ETA, readable errors
+- Playlist editing: add to playlist, create, remove and reorder
+- Video discovery: full genre list, genre chips, decade filter, Surprise me
+- Phone bottom sheets for reader panels, audiobook menus, downloads and confirms

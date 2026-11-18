@@ -1,0 +1,72 @@
+[package]
+name = "reader"
+version = "1.0.0"
+description = "Calibre-Web Offline Reader Desktop App"
+authors = ["Reader Team"]
+license = "MIT"
+repository = ""
+edition = "2021"
+
+# Required for iOS/Android: the app is loaded as a static library.
+# Name differs from the bin name ("reader") to avoid the Windows .lib
+# filename collision between the binary and the library artifacts.
+[lib]
+name = "reader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+# Receives the OIDC callback on iOS (custom mediamaster:// scheme). No desktop
+# schemes are configured, so it is a no-op on desktop — but the dependency must
+# be unconditional so the deep-link permission set exists on every platform.
+tauri-plugin-deep-link = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["cookies", "json", "stream", "rustls-tls"], default-features = false }
+futures-util = "0.3"
+base64 = "0.22"
+mime_guess = "2"
+url = "2"
+percent-encoding = "2"
+dirs = "5"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# OS credential store (Windows Credential Manager / macOS+iOS Keychain / Linux Secret Service)
+keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+
+# Mobile-only: haptic feedback (iOS Taptic Engine / Android vibrator)
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+tauri-plugin-haptics = "2"
+# Mobile-only: system media volume (in-repo plugin — the WebView cannot touch
+# the OS volume; iOS ignores HTMLMediaElement.volume entirely)
+tauri-plugin-system-volume = { path = "tauri-plugin-system-volume" }
+
+# Desktop-only: window geometry persistence does not compile for mobile targets
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+# Restores window size/position/monitor/maximized/fullscreen across restarts
+tauri-plugin-window-state = "2"
+
+[target.'cfg(windows)'.dependencies]
+# WebView2 COM bindings — auto-grant mic permission so audio device
+# enumeration (Settings → Advanced) works without a prompt.
+# Version must match tauri's transitive webview2-com (see Cargo.lock).
+webview2-com = "0.38"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+# Optimize for speed: DEFLATE decompression (manga pages), TLS and streaming
+# downloads are CPU-bound hot paths; "s" (size) made them measurably slower.
+opt-level = 3
+strip = true
