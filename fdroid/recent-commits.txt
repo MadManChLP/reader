@@ -1,0 +1,15 @@
+- Full release merging dev fetures into normal version
+- Roadmap: playback polish wave done, next wave updated
+- Reader: EPUB in-book search, working PDF links
+- Audiobooks: chapter list in the player, chapter on the lock screen, prev/next chapter keys, smart rewind after a pause
+- Video: hold for 2x, play from beginning, are you still watching, media keys follow seek settings + next/prev episode, early Stopped report; mask tokens in logs
+- Roadmap: playback memory wave done, next wave updated
+- Video: per-series audio/subtitle memory, server subtitle mode, skip recap/preview/credits, Up Next countdown from the credits
+- Music: remember queue, position, shuffle/repeat and volume across restarts
+- Roadmap: bug wave confirmed, stale notes removed, next wave reordered
+- Roadmap: medium bug wave and three QoL features done, stale rows removed
+- Downloads: notify when a download finishes
+- Reader: keep the screen on while reading
+- Video: playback speed (0.5–2×), remembered
+- Audiobooks: progress stays current, podcast episode rows on Home
+- Downloads: honour an early cancel, time out stalled transfers
